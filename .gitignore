@@ -1,0 +1,32 @@
+# Data lake — never commit
+data/raw/
+data/bronze/
+data/silver/
+data/gold/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# uv — keep uv.lock checked in, ignore caches
+.uv-cache/
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log
+*.crc
+_SUCCESS
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Notebooks
+.ipynb_checkpoints/

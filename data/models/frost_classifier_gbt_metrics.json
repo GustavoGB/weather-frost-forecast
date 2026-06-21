@@ -1,0 +1,71 @@
+{
+  "algorithm": "gbt",
+  "test_year": 2024,
+  "sample_fraction": 0.1,
+  "n_train": 4129022,
+  "n_test": 4080038,
+  "metrics": {
+    "roc_auc": 0.9797164430324582,
+    "pr_auc": 0.9536900028895039,
+    "accuracy": 0.9275901351899174,
+    "f1": 0.9274674330416773,
+    "weighted_precision": 0.9273679247921032,
+    "weighted_recall": 0.9275901351899174
+  },
+  "confusion": {
+    "tn": 2762500,
+    "fp": 141088,
+    "fn": 154347,
+    "tp": 1022103
+  },
+  "top_features": [
+    {
+      "feature": "tmin_c",
+      "importance": 0.3345802382952836
+    },
+    {
+      "feature": "tmin_c_roll7_min",
+      "importance": 0.25791606557930347
+    },
+    {
+      "feature": "tmin_c_roll30_mean",
+      "importance": 0.09930061000433749
+    },
+    {
+      "feature": "frost_days_roll30",
+      "importance": 0.0765752083257077
+    },
+    {
+      "feature": "tavg_c",
+      "importance": 0.07361404211959642
+    },
+    {
+      "feature": "tmin_c_roll7_mean",
+      "importance": 0.06210729443341071
+    },
+    {
+      "feature": "tmax_c",
+      "importance": 0.020789976027261584
+    },
+    {
+      "feature": "day_of_year",
+      "importance": 0.013996611301455821
+    },
+    {
+      "feature": "longitude",
+      "importance": 0.009416661049851406
+    },
+    {
+      "feature": "tmax_c_lag_1",
+      "importance": 0.00910287081164799
+    },
+    {
+      "feature": "tmin_c_lag_1",
+      "importance": 0.008495632150996451
+    },
+    {
+      "feature": "elevation_m",
+      "importance": 0.005662402010627143
+    }
+  ]
+}

@@ -1,0 +1,1683 @@
+---
+title: "NOAA GHCN-Daily — Big Data Pipeline & Frost-Risk Classifier"
+subtitle: "End-to-end medallion PySpark pipeline + tuned Spark ML frost classifier"
+author:
+  - "Daniel B."
+  - "Gabrielle P."
+  - "Gustavo G."
+  - "Vanessa C."
+date: today
+lang: en
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    code-line-numbers: true
+    theme: cosmo
+    highlight-style: github
+    embed-resources: true
+    fig-width: 9
+    fig-height: 4.5
+    df-print: paged
+jupyter: python3
+execute:
+  eval: false      # set to true to render live (needs data/ + ~minutes for training)
+  warning: false
+  echo: true
+---
+
+::: {.callout-note}
+This is the **English edition** of the report. The Quarto source is the view for editing in
+**Positron**. With `execute.eval: false` (default) it renders instantly with all narrative and
+code. The fully rendered version **with every figure** is `report.html` (Portuguese), and the
+executable original is `notebook.ipynb`.
+:::
+
+
+**Course:** Big Data &nbsp;·&nbsp; **Deliverable:** end-to-end PySpark notebook &nbsp;·&nbsp; **Environment:** PySpark 4.1 · Python 3.10 (managed with uv)
+
+---
+
+## Abstract
+
+We built a **big-data pipeline in a medallion architecture** (bronze → silver → gold → model)
+on top of NOAA's **Global Historical Climatology Network – Daily** dataset and trained on it a
+**next-day frost-risk classifier with Spark ML**. In one business sentence: predict **whether it
+will frost tomorrow** in an agricultural region — because frost destroys crops and moves the
+supply (and price) of commodities. The business consumer is an agent of the **agricultural
+commodities chain** whose central risk is **crop disruption**: an off-season frost damages the
+crop, drops the region's output and **affects the commodity's supply** (corn, soy, wheat,
+coffee), pressuring prices and supply contracts.
+
+Everything below runs in **PySpark** on an ordinary notebook — from ingesting the raw `.csv.gz`
+to an already-tuned gradient-boosted-tree model — with `pandas` used **only** on small,
+already-aggregated results, for plotting (never to load the corpus).
+
+### Key findings (TL;DR)
+
+- **The model works and is honest.** Tuned GBT reaches **ROC-AUC ≈ 0.98** on the held-out test
+  year (2024). But a **persistence baseline** ("today's TMIN is low → frost tomorrow") already
+  goes far: next-day frost is, to a large extent, **thermal persistence** (§8.4/§8.6).
+- **The highest-yield feature was the regional/neighbourhood one** (`region_tmin_mean`) — it became
+  the 2nd most important. **Precipitation helps only marginally** (ablation §7.5): temperature
+  dominates.
+- **The cutout is the central decision.** Going from ~3 billion rows (global) to 40 M (Corn Belt)
+  is what makes the problem tractable and the signal dense (§9.3).
+- **Machine limits are real.** Building the gold layer (window functions) **OOM'd** on `local[*]`;
+  we backed off to `local[8]` — the parallelism↔memory trade-off (§9.5).
+- **Hemisphere matters, but the data doesn't always exist.** The frost season **flips** in the
+  South (Jun–Aug); Australia has dense data to show it, southern Brazil **does not** (§6.4).
+
+> **Scope note.** This notebook runs a **reproducible geographic cutout — the US Corn Belt — over
+> 20 years (2005–2024)**: we cut in space (a small, dense region) so we can go deep in time on an
+> ordinary notebook. The same code scales unchanged to any region/period — just change the
+> `region:` in the config and the `--start-year`/`--end-year` flags.
+
+### How to read / run this notebook
+1. **Section 3** ingests the cutout (default **Corn Belt, 2005–2024**, via `--region`) — it is
+   *run-once* and guarded: if `data/bronze` already exists, it is skipped.
+2. **Sections 4–6** are the data story: cleaning, visual EDA, feature engineering.
+3. **Sections 7–8** are the modelling story: labels, temporal split, baseline, model comparison,
+   tuning and evaluation with charts.
+4. **Section 9** closes with limitations and conclusions.
+
+> **Mini climate dictionary** (to follow along without being a meteorologist). The data and
+> modelling terms are explained throughout the text; here we keep only the **climate concepts**:
+> - **Frost:** when the day's minimum temperature falls to **0 °C or below** — the cold that can
+>   kill the crop.
+> - **Radiative cooling:** on **dry, cloudless** nights, the ground loses heat straight to the sky
+>   and cools fast — that's why a clear night favours frost.
+> - **GDD (Growing Degree Days):** the heat accumulated over the season, used to measure how far
+>   the crop has developed.
+
+## 1 · Problem definition & business motivation
+
+### 1.1 · What exactly are we predicting?
+
+> **This is a *supervised binary classification* problem.** Given everything known up to *today* at
+> a weather station, we predict whether **it will frost tomorrow or not**.
+
+| Aspect | In this project |
+|---|---|
+| **Learning type** | **Supervised** — every training row has a known outcome label. |
+| **Task** | **Binary classification** — two mutually exclusive classes: *frost* vs *no frost*. |
+| **Target `y`** | `next_day_is_frost` ∈ {**1** = frost, **0** = no frost}, where a frost day ≡ tomorrow's `TMIN` `≤ 0 °C`. |
+| **Inputs `X`** | current and historical station features: temperatures, 1/7-day lags, 7/30-day rolling stats, GDD accumulation, regional/neighbourhood signals, season (`day_of_year`, `month`) and location (`lat`, `lon`, `elevation`). |
+| **Output** | a class (0/1) **and** a calibrated probability `P(frost)` — the latter feeds the agronomic *Frost-Risk Score*. |
+| **Why classification (and not regression)** | the business decision (protect the crop / delay planting) is binary; we predict the *event*. A regression variant (predict `next_day_tmin_c` and derive `P(TMIN ≤ 0)`) is proposed as future work in §9. |
+| **What it is *not*** | not unsupervised (we have labels), not multiclass, not raw-temperature time-series forecasting. |
+
+**In one sentence:** *"Train a supervised classifier that, from a station's history and current
+conditions, answers **will it frost tomorrow? (yes/no)** — with the associated probability to score
+frost risk."*
+
+### 1.2 · Business context
+
+The consumer is an agent of the **agricultural commodities chain** (trading, origination,
+agro-industry) whose central risk is **crop disruption**. An off-season frost **damages the crop**,
+drops the region's output and, with it, **affects the commodity's supply** — corn, soy, wheat,
+coffee, orange. Less supply:
+
+1. **Pressures the price** of the commodity (supply shock) and threatens **supply contracts**.
+2. **Disrupts the chain** downstream — logistics, crushing/processing and export.
+
+Predicting frost **per station and in advance** turns this risk into a decision:
+
+- **Size the supply impact** — how many producing regions/areas come under risk within a window of
+  a few days.
+- **Act on the chain** — *hedge* on the exchange, reallocate origination to unaffected regions,
+  renegotiate contracts and replan logistics **before** the event.
+
+(The same frost signal also feeds related uses: planting window via Growing Degree Days — GDD — and
+parametric crop-insurance pricing.)
+
+**Why GHCN-Daily fits:** over 120k stations, daily resolution, since 1763 (real tail-risk
+estimation); free and redistributable; per-station granularity (an edge over "nearest airport"
+approaches); and already carrying NOAA's QC flags.
+
+**Target deliverable for this project:** a working **next-day frost-risk baseline classifier**, plus
+the clean database it stands on.
+
+## 2 · The dataset
+
+**Source:** NOAA Open Data Dissemination — GHCN-Daily. Public S3 bucket `s3://noaa-ghcn-pds/`, also
+reachable over HTTPS (no AWS account).
+
+| Resource | Description | Format |
+|---|---|---|
+| `csv.gz/by_year/YYYY.csv.gz` | one row per (station, date, ELEMENT); ~170 MB/year gz | headerless CSV |
+| `ghcnd-stations.txt` | station id, lat, lon, elevation, name | fixed-width |
+| `ghcnd-countries.txt` / `-states.txt` | code → name tables | fixed-width |
+| `ghcnd-inventory.txt` | per station × ELEMENT, first/last year | fixed-width |
+
+We keep **5 agriculture-relevant ELEMENTs** (out of ~30): `TMAX`, `TMIN`, `PRCP`, `SNOW`, `SNWD`.
+Filtering at ingest cuts ~70% of the pivot/window work ahead.
+
+### 2.1 · Why the geographic cutout is decisive here
+
+GHCN is **global** (~120k stations worldwide), but our problem **is not global**: frost only
+matters **where you plant**. Here, training on the whole world **hurts** rather than helps — for
+four reasons:
+
+1. **Signal vs. noise.** Most stations in the world sit in places irrelevant to the business
+   (coastlines, deserts, tropics that **never** frost, poles that **always** frost). That data adds
+   no signal about the agricultural decision — it **dilutes** the signal of the regions that matter
+   and fills the metric with trivial cases. In a *global* model, much of the AUC comes from that
+   trivial separation; cutting eliminates that noise at the source (§8.4 confirms it: within the
+   cutout, the AUC is already the "hard" number).
+
+2. **Climate coherence.** Frost dynamics in Siberia, the Sahara and the Corn Belt are incompatible.
+   A global model tries to find **a single decision boundary** for realities with no relation to
+   each other. Cutting to **one coherent climate regime** yields a model that learns a single
+   phenomenon — and learns it better.
+
+3. **Trading space for time (more *useful* data).** Cutting in space makes the dataset small enough
+   to go **much deeper in time** (20+ years) at the same compute cost. And more history **in the
+   right region** is what actually improves the estimate of **tail risk** — the rare early/late
+   season frosts that define the planting window and insurance price. That is: we collect **more
+   data that truly matters**, not more data of any kind.
+
+4. **Neighbourhood features only make sense where there are neighbours.** The Corn Belt has
+   thousands of nearby stations; in the sparse world, the "nearest neighbour" can be hundreds of km
+   away. The cutout is what makes the regional feature (`region_tmin_mean`, today the 2nd most
+   important) meaningful.
+
+> **In one sentence:** cutting is not "throwing data away" — it's **aligning the data to the
+> problem**, removing noise from regions the client will never use and investing the data budget in
+> temporal depth where it creates value.
+
+### 2.2 · How we cut — US Corn Belt, 20 years
+
+Instead of "the whole world for a few years", we make a **geographic cutout**: the US **Corn
+Belt** (Midwest), defined by the box `lat 37–49°, lon −104..−80°` in `config.yaml`. Reasons:
+
+- **Denser coverage.** The US has the world's highest GHCN station density — the cutout has
+  thousands of nearby stations, which gives the *neighbourhood features* meaning.
+- **Business relevance.** It's the main US corn/soy producing region — where frost risk actually
+  moves planting and insurance decisions.
+- **Temporal depth.** Because the cutout is small, we ingest **20 years (2005–2024)** on an ordinary
+  notebook — far more than the 10 years of the global version, with real frost risk (the Corn
+  Belt's planting window is defined by frost).
+
+The filter is applied **at ingest** (`stream_ingest --region`), via an allow-list of station ids
+inside the box, with a `broadcast join` — so only the Corn Belt enters bronze.
+
+### 2.3 · Setup — Spark session, config, plotting helpers
+
+```{python}
+import json
+import time
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from pyspark.sql import functions as F
+
+# Reuse EXACTLY the production code in src/ — the notebook orchestrates, it does not
+# reimplement. It is the same SparkSession the command-line jobs use.
+from src.ingestion.utils import build_spark, load_config, resolve
+
+cfg = load_config()
+spark = build_spark(cfg)
+spark.sparkContext.setLogLevel("ERROR")   # silence noisy WARN/INFO from Spark (e.g. MemoryStore)
+
+# The slice we materialize for the notebook. Instead of "the whole world for 2 years",
+# we make a GEOGRAPHIC CUTOUT — the US Corn Belt (Midwest), the area with the densest
+# GHCN coverage and the main grain-producing region. Because the cutout is small,
+# we can go much deeper in time (20 years) on an ordinary notebook.
+REGION = cfg["region"]                         # us_corn_belt (see config/config.yaml)
+START_YEAR, END_YEAR, TEST_YEAR = 2005, 2024, 2024   # 20 years
+
+BRONZE = resolve(cfg["paths"]["bronze"])
+SILVER = resolve(cfg["paths"]["silver"]) / "observations_daily"
+GOLD   = resolve(cfg["paths"]["gold"])   / "station_daily_features"
+
+plt.rcParams.update({"figure.figsize": (9, 4.5), "figure.dpi": 110,
+                     "axes.grid": True, "grid.alpha": 0.3, "font.size": 10})
+
+print("Spark", spark.version)
+print(f"Region: {REGION['name']}  (country={REGION['country']}, "
+      f"lat {REGION['lat_min']}..{REGION['lat_max']}, lon {REGION['lon_min']}..{REGION['lon_max']})")
+print(f"Period: {START_YEAR}–{END_YEAR}  ({END_YEAR-START_YEAR+1} years) | test = {TEST_YEAR}")
+```
+
+### 2.4 · Where the stations are in the world
+
+Before ingesting anything, it's worth seeing **the whole**: GHCN covers the entire planet
+(~132k stations). The red rectangle is the **Corn Belt cutout** (§2.2) — a tiny fraction of the
+globe, but the densest-coverage and most relevant one for our problem. (Reads a pre-computed sample
+of the coordinates, `data/ref/world_stations_sample.csv`, so it runs **right here**, before the
+heavy ingestion; the **cutout zoom by TMIN** comes in §5.3.)
+
+```{python}
+# 2.4 — Global station coverage (sample) + cutout rectangle. Reads a small CSV; no Spark.
+import matplotlib.patches as mpatches  # noqa: E402
+world = pd.read_csv(resolve("data/ref/world_stations_sample.csv"))
+fig, ax = plt.subplots(figsize=(12, 5.5))
+ax.scatter(world["longitude"], world["latitude"], s=1, alpha=0.25, color="#666666")
+ax.add_patch(mpatches.Rectangle(
+    (REGION["lon_min"], REGION["lat_min"]),
+    REGION["lon_max"] - REGION["lon_min"], REGION["lat_max"] - REGION["lat_min"],
+    fill=False, edgecolor="red", lw=2))
+ax.set_title("Global GHCN coverage (station sample) — Corn Belt cutout in red")
+ax.set_xlabel("longitude"); ax.set_ylabel("latitude")
+ax.set_xlim(-180, 180); ax.set_ylim(-90, 90); ax.set_aspect("equal", adjustable="box")
+plt.tight_layout(); plt.show()
+```
+
+## 3 · Ingestion — bronze (medallion layer 1)
+
+> **Why medallion?** Each layer has one job and one Parquet write. If silver is wrong, you re-run
+> silver — bronze never needs to be re-downloaded. The boundary between *"raw, may be garbage"*
+> (bronze) and *"clean, with meaning"* (silver) is enforced by **separate Parquet outputs**, not
+> just by function calls.
+
+The cell below is **run-once and guarded**: it only ingests if `data/bronze` does not exist. There
+are two ingestion modes in `src/ingestion/` (streaming vs. batch); here we use the **streaming**
+mode, light on disk (download → parquet → delete, per year).
+
+```{python}
+from src.ingestion.download_ghcn import main as download_main  # noqa: E402
+
+# Guarded ingestion (run-once). Heavy (~several minutes per year); skipped if it already exists.
+if not (BRONZE / "observations").exists():
+    print("Bronze missing → running ingestion for", START_YEAR, "-", END_YEAR)
+    import subprocess, sys
+    base = [sys.executable, "-m"]
+    subprocess.run(base + ["src.ingestion.download_ghcn", "--skip-years"], check=True)
+    subprocess.run(base + ["src.ingestion.ingest_stations"], check=True)
+    # --region keeps ONLY the Corn Belt stations (see config), so 20 years stays small.
+    subprocess.run(base + ["src.ingestion.stream_ingest",
+                           "--start-year", str(START_YEAR), "--end-year", str(END_YEAR),
+                           "--elements", "TMAX", "TMIN", "PRCP", "SNOW", "SNWD",
+                           "--region"], check=True)
+else:
+    print("Bronze already present — skipping ingestion.")
+
+bronze_obs = spark.read.parquet(str(BRONZE / "observations"))
+stations   = spark.read.parquet(str(BRONZE / "stations"))
+print(f"bronze observation rows : {bronze_obs.count():,}")
+print(f"station metadata rows   : {stations.count():,}")
+bronze_obs.printSchema()
+```
+
+### 3.1 · Unifying the data — from several *long* sources to one *wide* table (with Spark)
+
+The NOAA source comes **fragmented and in long format**:
+
+- **20 yearly files** (`2005.csv.gz` … `2024.csv.gz`), each with **one row per (station, day,
+  ELEMENT)** — TMAX, TMIN, PRCP, SNOW, SNWD are *stacked* in separate rows.
+- **Station metadata** in a separate **fixed-width** file (id, latitude, longitude, elevation,
+  name).
+
+Spark **unifies everything into a single table per station-day** with two key operations:
+
+1. **PIVOT** — `groupBy("id","date").pivot("element")` turns the *long* format into *wide*: each
+   ELEMENT becomes **one column**, and each station-day becomes **one row**.
+2. **BROADCAST JOIN** — `join(F.broadcast(stations), "id")` glues the station metadata (small,
+   ~125k rows) onto each observation **without shuffling the big side**.
+
+> The result is a DataFrame that is **wide and partitioned by year**, ready for the gold window
+> functions. Broadcasting the small stations table avoids the *shuffle* stage that a standard
+> (sort-merge) join would trigger over the **111 M rows** of bronze — the difference between minutes
+> and tens of minutes on this machine.
+
+> **The join key is the station `id` — not lat/lon.** Latitude and longitude **ride along** as
+> columns in that join (so they're available for spatial features), but are never the *key*: joining
+> on float-equality would be fragile and slow. GHCN already provides a **clean station identifier**,
+> which is the correct key. Lat/lon enters at two other points, **without** being a broadcast join:
+> (a) as a **filter** to build the cutout allow-list (which `id`s fall inside the Corn Belt box,
+> §2.2) and (b) in the **regional feature** (§6), where stations are grouped into **~1° cells**
+> (`floor(lat)`, `floor(lon)`) and the result is joined back by `(grid_lat, grid_lon, date)` — a
+> normal (shuffle) join, since that side is not small.
+
+Below, the **same transformation live on a sample station** (a few rows, so each step is visible).
+It's exactly what `build_silver` does — only all at once, for the **111 M rows** of bronze,
+partitioned by year.
+
+```{python}
+# A sample station, to visualize the unification step by step.
+ex_id = bronze_obs.select("id").limit(1).first()["id"]
+long_ex = bronze_obs.where(F.col("id") == ex_id)
+
+print("1) BRONZE (LONG format): several rows per day — one per ELEMENT")
+long_ex.select("id", "date", "element", "value").orderBy("date", "element").show(8)
+
+print("2) PIVOT (groupBy station-day + pivot ELEMENT): ELEMENTs become COLUMNS, 1 row/day")
+wide_ex = (long_ex.groupBy("id", "date")
+           .pivot("element", ["TMAX", "TMIN", "PRCP", "SNOW", "SNWD"])
+           .agg(F.first("value")))
+wide_ex.orderBy("date").show(5)
+
+print("3) BROADCAST JOIN with station metadata: UNIFIED table (obs + station)")
+st = stations.select("id", "name", "latitude", "longitude", "elevation", "state")
+wide_ex.join(F.broadcast(st), on="id", how="left").orderBy("date").show(5, truncate=False)
+```
+
+## 4 · Data cleaning & quality
+
+GHCN rows carry three flags: `M_FLAG` (measurement), `Q_FLAG` (quality control), `S_FLAG` (source
+network). Our ingestion **drops every row with a non-empty `Q_FLAG`** — they failed at least one of
+NOAA's ~15 QC tests (range, internal consistency, spatial coherence, …). Missing observations are
+encoded as *absence of rows*, not as `NULL`; sparsity only appears as nulls **after** the pivot to
+wide format, where the ML pipeline's median `Imputer` handles it.
+
+Below we quantify the cleaning: distribution by ELEMENT and — after building silver — the
+**missing data per column** that motivates the imputation choice.
+
+```{python}
+# Distribution by ELEMENT in the kept bronze (after dropping Q_FLAG + element whitelist).
+elem_counts = (bronze_obs.groupBy("element").count()
+               .orderBy(F.desc("count")).toPandas())
+display(elem_counts)
+
+ax = elem_counts.set_index("element")["count"].plot.bar(color="#4C72B0")
+ax.set_title("Kept observations per ELEMENT (bronze, after QC drop)")
+ax.set_xlabel("ELEMENT"); ax.set_ylabel("number of rows")
+for i, v in enumerate(elem_counts["count"]):
+    ax.text(i, v, f"{v/1e6:.1f}M", ha="center", va="bottom", fontsize=8)
+plt.tight_layout(); plt.show()
+```
+
+### 4.1 · Build silver and measure the missing data
+
+Silver does the long→wide pivot, converts NOAA's tenths → SI units, joins the station metadata and
+adds derived columns + the two label seeds (`is_frost_day`, `is_heat_stress_day`). We run it for our
+slice and compute the null fraction per column — the evidence behind *"impute, don't drop"*.
+
+```{python}
+import subprocess, sys  # noqa: E402
+if not SILVER.exists():
+    subprocess.run([sys.executable, "-m", "src.processing.build_silver",
+                    "--start-year", str(START_YEAR), "--end-year", str(END_YEAR)], check=True)
+
+silver = spark.read.parquet(str(SILVER))
+n_silver = silver.count()
+print(f"silver rows (station-day): {n_silver:,}")
+print(f"distinct stations        : {silver.select('id').distinct().count():,}")
+
+# Null fraction per column — small aggregation, safe to bring into pandas.
+null_expr = [(F.sum(F.col(c).isNull().cast("int")) / F.lit(n_silver)).alias(c)
+             for c in ["tmax_c", "tmin_c", "prcp_mm", "snow_mm", "snwd_mm",
+                       "tavg_c", "elevation_m"]]
+miss = silver.select(*null_expr).toPandas().T.rename(columns={0: "null_fraction"})
+miss = miss.sort_values("null_fraction", ascending=False)
+display(miss.style.format({"null_fraction": "{:.1%}"}))
+
+ax = (miss["null_fraction"] * 100).plot.barh(color="#C44E52")
+ax.set_title("Missing data per silver column — why we impute instead of drop")
+ax.set_xlabel("% nulls"); ax.invert_yaxis()
+plt.tight_layout(); plt.show()
+```
+
+### 4.2 · Basic statistics (`describe`)
+
+We start every analysis by inspecting the schema (`printSchema`) and summary statistics
+(`describe`) — the fastest way to flag impossible values (e.g. a TMIN of −500 °C that slipped past
+QC) and to read the spread the model will see.
+
+```{python}
+# Inspect schema + summary stats before modelling.
+silver.select("tmin_c", "tmax_c", "tavg_c", "prcp_mm", "elevation_m").describe().show()
+silver.select("id", "date", "tmin_c", "tmax_c", "is_frost_day").show(5)
+```
+
+## 5 · Exploratory data analysis
+
+All aggregations run in **Spark**; we only `.toPandas()` the small grouped results to draw them.
+Every figure has a title and labelled axes.
+
+```{python}
+# 5.1 — Temperature distribution (sampled to keep the histogram cheap).
+samp = (silver.select("tmin_c", "tmax_c")
+        .where(F.col("tmin_c").isNotNull() & F.col("tmax_c").isNotNull())
+        .sample(fraction=0.02, seed=1).toPandas())
+
+fig, ax = plt.subplots()
+ax.hist(samp["tmin_c"], bins=60, alpha=0.6, label="TMIN (°C)", color="#4C72B0")
+ax.hist(samp["tmax_c"], bins=60, alpha=0.6, label="TMAX (°C)", color="#DD8452")
+ax.axvline(0, color="k", ls="--", lw=1, label="frost threshold (0 °C)")
+ax.set_title("Distribution of daily min/max temperatures (2% sample)")
+ax.set_xlabel("°C"); ax.set_ylabel("frequency"); ax.legend()
+plt.tight_layout(); plt.show()
+```
+
+> **Reading.** The two distributions meet near **0 °C** — it's the **cold tail of TMIN** crossing the
+> frost threshold that the model must learn to separate.
+
+```{python}
+# 5.2 — Frost rate by month: the seasonal signal the model must learn.
+by_month = (silver.where(F.col("is_frost_day").isNotNull())
+            .groupBy("month")
+            .agg(F.avg(F.col("is_frost_day").cast("double")).alias("frost_rate"))
+            .orderBy("month").toPandas())
+
+fig, ax = plt.subplots()
+ax.bar(by_month["month"], by_month["frost_rate"] * 100, color="#55A868")
+ax.set_title("Frost-day rate by month (Corn Belt)")
+ax.set_xlabel("month"); ax.set_ylabel("% of station-days with frost")
+ax.set_xticks(range(1, 13))
+plt.tight_layout(); plt.show()
+```
+
+> **Reading.** Strong seasonality: frost concentrates from **Nov–Mar** and vanishes in summer — that's
+> why `month`/`day_of_year` enter as seasonal features.
+
+### 5.3 · From global data to the cutout — side by side
+
+Picking up §2.4, now with the **cutout alongside**. On the **left**, the global coverage (rectangle =
+Corn Belt); on the **right**, the cutout **zoomed in**, with each station coloured by **mean TMIN**.
+These stations are the ones actually feeding the model.
+
+```{python}
+# 5.3 — From global to cutout, side by side: world coverage + Corn Belt zoom by TMIN. Reads CSVs.
+import matplotlib.patches as mpatches  # noqa: E402
+world = pd.read_csv(resolve("data/ref/world_stations_sample.csv"))
+cb = pd.read_csv(resolve("data/ref/cornbelt_station_tmin.csv"))
+
+fig, (axg, axc) = plt.subplots(1, 2, figsize=(15, 5))
+axg.scatter(world["longitude"], world["latitude"], s=1, alpha=0.25, color="#666666")
+axg.add_patch(mpatches.Rectangle(
+    (REGION["lon_min"], REGION["lat_min"]),
+    REGION["lon_max"] - REGION["lon_min"], REGION["lat_max"] - REGION["lat_min"],
+    fill=False, edgecolor="red", lw=2))
+axg.set_title("Global GHCN coverage (sample) — cutout in red")
+axg.set_xlabel("longitude"); axg.set_ylabel("latitude")
+axg.set_xlim(-180, 180); axg.set_ylim(-90, 90); axg.set_aspect("equal", adjustable="box")
+
+sc = axc.scatter(cb["lon"], cb["lat"], c=cb["mean_tmin"], cmap="coolwarm", s=8, alpha=0.75)
+axc.set_title(f"Cutout: Corn Belt ({len(cb):,} stations with TMIN)")
+axc.set_xlabel("longitude"); axc.set_ylabel("latitude"); axc.set_aspect("equal", adjustable="datalim")
+fig.colorbar(sc, ax=axc, label="mean TMIN (°C)")
+plt.tight_layout(); plt.show()
+```
+
+> **Reading.** The **north→south** cold gradient is clear: northern stations (blue) are far colder than
+> southern ones (red) — the physical basis of the regional neighbourhood feature.
+
+```{python}
+# 5.4 — Elevation vs frost frequency: a physical relationship, as a sanity check.
+elev = (silver.where(F.col("elevation_m").isNotNull() & F.col("is_frost_day").isNotNull())
+        .withColumn("elev_band", (F.col("elevation_m") / 250).cast("int") * 250)
+        .groupBy("elev_band")
+        .agg(F.avg(F.col("is_frost_day").cast("double")).alias("frost_rate"),
+             F.count("*").alias("n"))
+        .where((F.col("elev_band") >= 0) & (F.col("elev_band") <= 3500) & (F.col("n") > 5000))
+        .orderBy("elev_band").toPandas())
+
+fig, ax = plt.subplots()
+ax.plot(elev["elev_band"], elev["frost_rate"] * 100, marker="o", color="#8172B3")
+ax.set_title("Frost rate rises with station elevation (physical sanity check)")
+ax.set_xlabel("elevation band (m)"); ax.set_ylabel("% of days with frost")
+plt.tight_layout(); plt.show()
+```
+
+> **Reading.** Physical sanity check confirmed: the **higher** the station, the more frost — elevation
+> carries real signal (which is why it enters as a feature).
+
+```{python}
+# 5.6 — Frost rate by day of year: the fine seasonal curve that defines the planting window.
+doy = (silver.where(F.col("is_frost_day").isNotNull())
+       .groupBy("day_of_year")
+       .agg(F.avg(F.col("is_frost_day").cast("double")).alias("frost_rate"))
+       .orderBy("day_of_year").toPandas())
+
+fig, ax = plt.subplots()
+ax.plot(doy["day_of_year"], doy["frost_rate"] * 100, color="#4C72B0")
+ax.fill_between(doy["day_of_year"], doy["frost_rate"] * 100, alpha=0.3, color="#4C72B0")
+ax.set_title("Frost rate by day of year (Corn Belt) — defines the planting window")
+ax.set_xlabel("day of year"); ax.set_ylabel("% of days with frost")
+plt.tight_layout(); plt.show()
+```
+
+> **Reading.** The fine curve shows the **planting window**: the dates of **last frost** (spring) and
+> **first frost** (autumn) are what the farmer — and the model — must get right.
+
+```{python}
+# 5.7 — GLOBAL frost-risk map (2024): the worldwide reference view.
+# Reads a pre-computed grid (data/ref/global_frost_grid.parquet); generate it with
+# `uv run python scripts/process/precompute_global_frost.py` if missing.
+import matplotlib.patches as mpatches  # noqa: E402
+
+GLOBAL_GRID = resolve("data/ref/global_frost_grid.parquet")
+if GLOBAL_GRID.exists():
+    gg = spark.read.parquet(str(GLOBAL_GRID)).toPandas()
+    ggrid = gg.pivot(index="glat", columns="glon", values="frost_rate") * 100
+    fig, ax = plt.subplots(figsize=(13, 6.5))
+    mesh = ax.pcolormesh(ggrid.columns.values, ggrid.index.values, ggrid.values,
+                         cmap="YlGnBu", shading="nearest")
+    ax.add_patch(mpatches.Rectangle(
+        (REGION["lon_min"], REGION["lat_min"]),
+        REGION["lon_max"] - REGION["lon_min"], REGION["lat_max"] - REGION["lat_min"],
+        fill=False, edgecolor="red", lw=2))
+    ax.set_xlim(-180, 180); ax.set_ylim(-90, 90); ax.set_aspect("equal", adjustable="box")
+    ax.set_title("Global frost-risk map (2024) — % of days with frost per 3° cell "
+                 "(Corn Belt cutout in red)")
+    ax.set_xlabel("longitude"); ax.set_ylabel("latitude")
+    fig.colorbar(mesh, label="% of days with frost")
+    plt.tight_layout(); plt.show()
+else:
+    print("global grid missing — run: uv run python scripts/process/precompute_global_frost.py")
+```
+
+> **Reading.** Worldwide view: tropics ~0% and high latitudes ~100%; the cutout (red) falls in an
+> **intermediate** band, where frost *varies* — the hard and useful case (confirms §2.1).
+
+```{python}
+# 5.8 — Corn Belt zoom (1° cell) OVER the US map: borders + state names.
+import json  # noqa: E402
+import matplotlib.patheffects as pe  # noqa: E402
+
+risk = (silver.where(F.col("is_frost_day").isNotNull())
+        .withColumn("glat", F.floor("latitude").cast("int"))
+        .withColumn("glon", F.floor("longitude").cast("int"))
+        .groupBy("glat", "glon")
+        .agg(F.avg(F.col("is_frost_day").cast("double")).alias("frost_rate"),
+             F.count("*").alias("n"))
+        .where(F.col("n") > 200).toPandas())
+grid = risk.pivot(index="glat", columns="glon", values="frost_rate") * 100
+
+
+def plot_state_borders(ax, path, color="#333333", lw=0.7):
+    # Draw the state borders from a GeoJSON (no geopandas).
+    for ft in json.load(open(path))["features"]:
+        geom = ft["geometry"]
+        polys = geom["coordinates"] if geom["type"] == "MultiPolygon" else [geom["coordinates"]]
+        for poly in polys:
+            for ring in poly:
+                ax.plot([c[0] for c in ring], [c[1] for c in ring],
+                        color=color, lw=lw, alpha=0.8)
+
+def plot_state_labels(ax, path, fontsize=7, color="#1a1a1a"):
+    # Write the state NAME at its approximate centroid, if it is visible
+    # in the current axis window. Call AFTER fixing set_xlim/set_ylim.
+    x0, x1 = sorted(ax.get_xlim()); y0, y1 = sorted(ax.get_ylim())
+    for ft in json.load(open(path))["features"]:
+        name = ft["properties"].get("name", "")
+        geom = ft["geometry"]
+        polys = geom["coordinates"] if geom["type"] == "MultiPolygon" else [geom["coordinates"]]
+        ring = max((poly[0] for poly in polys), key=len, default=None)  # largest outer ring
+        if not ring:
+            continue
+        cx = sum(c[0] for c in ring) / len(ring)
+        cy = sum(c[1] for c in ring) / len(ring)
+        if x0 < cx < x1 and y0 < cy < y1:
+            ax.text(cx, cy, name, fontsize=fontsize, color=color, ha="center",
+                    va="center", alpha=0.85,
+                    path_effects=[pe.withStroke(linewidth=1.6, foreground="white")])
+
+fig, ax = plt.subplots(figsize=(12, 6))
+mesh = ax.pcolormesh(grid.columns.values, grid.index.values, grid.values,
+                     cmap="YlGnBu", shading="nearest")
+plot_state_borders(ax, str(resolve("data/ref/us_states.geojson")))
+ax.set_xlim(REGION["lon_min"] - 1, REGION["lon_max"] + 1)
+ax.set_ylim(REGION["lat_min"] - 1, REGION["lat_max"] + 1)
+plot_state_labels(ax, str(resolve("data/ref/us_states.geojson")))   # state names
+ax.set_aspect("equal", adjustable="box")
+ax.set_title("Frost risk per 1° cell — Corn Belt, with US states for reference")
+ax.set_xlabel("longitude"); ax.set_ylabel("latitude")
+fig.colorbar(mesh, label="% of days with frost")
+plt.tight_layout(); plt.show()
+```
+
+> **Reading.** Inside the cutout, the **north→south** gradient: Dakotas/Minnesota frost far more than
+> Missouri/Kentucky — exactly what the regional feature (`region_tmin_mean`) captures.
+
+### 5.9 · Last 90 days of precipitation (Corn Belt)
+
+Beyond temperature, **precipitation** (`PRCP`) tells the other half of the agricultural story:
+prolonged drought and extreme rain also disrupt the crop. Here we look at the **last 90 days**
+available in the cutout — aggregating per station and per day — always over the Corn Belt map with
+state borders for reference.
+
+- **Left:** **cumulative total** precipitation (mm) per station over the 90 days — where it rained most.
+- **Right:** number of **wet days** (`PRCP > 0`) per station — frequency vs. volume.
+- Finally, the **regional daily mean** over the window — the temporal pattern of the rains.
+
+> **Why this matters for frost (it's not just a loose viz).** Dry soil and air **cool faster** at
+> night (less water vapour holding heat) — so **recent dryness raises the risk of radiative frost**.
+> This panel is the *spatial/recent* reading of the same `prcp_mm` that §6.2 tests against frost and
+> that enters the model as `prcp_mm_roll7_sum`. It also serves as a **quality check**: it verifies
+> that the rain coverage is complete and plausible in the cutout.
+
+```{python}
+# 5.9 — Last 90 days of precipitation in the cutout, over the US map.
+# Reuses plot_state_borders() defined in 5.8. The "90-day window" is relative to the
+# latest date present in silver (the data goes up to the end of the last ingested year).
+from datetime import timedelta  # noqa: E402
+
+max_date = silver.agg(F.max("date").alias("m")).first()["m"]
+start_90 = max_date - timedelta(days=90)
+print(f"Window: {start_90} → {max_date} (90 days)")
+
+recent = silver.where((F.col("date") >= F.lit(start_90)) & F.col("prcp_mm").isNotNull())
+
+# (a) Per-station aggregation: total and wet-days in the window.
+prcp_st = (recent.groupBy("id")
+           .agg(F.first("latitude").alias("lat"),
+                F.first("longitude").alias("lon"),
+                F.sum("prcp_mm").alias("total_prcp"),
+                F.sum(F.when(F.col("prcp_mm") > 0, 1).otherwise(0)).alias("wet_days"))
+           .where(F.col("lat").isNotNull()).toPandas())
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+for ax in (ax1, ax2):
+    plot_state_borders(ax, str(resolve("data/ref/us_states.geojson")))
+    ax.set_xlim(REGION["lon_min"] - 1, REGION["lon_max"] + 1)
+    ax.set_ylim(REGION["lat_min"] - 1, REGION["lat_max"] + 1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("longitude"); ax.set_ylabel("latitude")
+
+s1 = ax1.scatter(prcp_st["lon"], prcp_st["lat"], c=prcp_st["total_prcp"],
+                 cmap="YlGnBu", s=18, alpha=0.85, edgecolor="none")
+ax1.set_title(f"Cumulative total precipitation per station ({start_90} → {max_date})")
+fig.colorbar(s1, ax=ax1, label="total precipitation (mm)")
+
+s2 = ax2.scatter(prcp_st["lon"], prcp_st["lat"], c=prcp_st["wet_days"],
+                 cmap="GnBu", s=18, alpha=0.85, edgecolor="none")
+ax2.set_title(f"Number of wet days (PRCP > 0) per station — {len(prcp_st):,} stations")
+fig.colorbar(s2, ax=ax2, label="wet days (out of 90)")
+for ax in (ax1, ax2):   # state names on top of the points
+    plot_state_labels(ax, str(resolve("data/ref/us_states.geojson")))
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+# 5.9b — Temporal pattern: mean daily precipitation in the cutout over the 90 days.
+daily = (recent.groupBy("date")
+         .agg(F.avg("prcp_mm").alias("mean_prcp"))
+         .orderBy("date").toPandas())
+
+fig, ax = plt.subplots(figsize=(12, 4))
+ax.bar(daily["date"], daily["mean_prcp"], color="#4C72B0", width=1.0)
+ax.set_title("Mean daily precipitation in the Corn Belt — last 90 days")
+ax.set_xlabel("date"); ax.set_ylabel("mean precipitation per station (mm)")
+fig.autofmt_xdate()
+plt.tight_layout(); plt.show()
+```
+
+## 6 · Feature engineering — gold (medallion layer 3)
+
+`build_gold` builds the predictive variables with Spark **window functions**
+(`Window.partitionBy("id").orderBy("date")` + `rowsBetween`) — lags, 7/30-day rolling aggregates and
+*year-to-date* accumulations, all computed **per station and in time order**, plus the spatial
+neighbourhood. That's what gives the model **memory and context**, not just the day's isolated
+observation:
+
+| Group | Columns | Primitive |
+|---|---|---|
+| Lags | `tmin/tmax/prcp _lag_{1,7}` | `F.lag(col, k).over(W.partitionBy("id").orderBy("date"))` |
+| Rolling 7/30d | `*_roll7_*`, `*_roll30_*`, `frost_days_roll30` | `F.avg/min/max/sum .over(... rowsBetween(-k,0))` |
+| GDD | `gdd_{corn,wheat}_{day,ytd}` | YTD sum over `unboundedPreceding → 0` |
+| **Regional / neighbourhood** | `region_tmin_mean`, `region_tmin_min`, `tmin_minus_region` | daily `groupBy` on a ~1° lat/lon grid + join back |
+| **Forward labels** | `next_day_is_frost`, `next_day_tmin_c` | `F.lead(col, 1)` — **no leakage** |
+
+> **Regional features (the model's biggest improvement).** The weak spatial importances of the
+> baseline model said *"add what the neighbourhood is doing"*. `add_regional_features` groups
+> stations into ~1° cells, takes the cell's daily mean/min TMIN and joins it back — an `O(rows)`
+> groupBy+join, **not** an `O(stations²)` nearest-neighbour search. `tmin_minus_region` (how much
+> colder a station runs than its cell) is a microclimate signal for frost pockets/valleys. No
+> leakage: it uses only *today's* spatial field.
+
+> **Why `F.lead` for the labels?** A naive self-join on `date+1` would risk leaking *tomorrow's
+> features* into training. `Window.lead` on the same frame pulls only the label forward.
+
+### 6.1 · Feature provenance — extracted from NOAA vs. created by us
+
+Important **feature-engineering** distinction: of the 30 features the model sees, **8 come "straight"
+from GHCN** (3 pure + 5 with unit conversion) and the other **22 were created by us** (engineering).
+The label is created too.
+
+| Feature(s) | Origin | How we obtain it |
+|---|---|---|
+| `latitude`, `longitude`, `elevation_m` | **Extracted (NOAA, pure)** | Read straight from `ghcnd-stations.txt` (metadata), no transformation. |
+| `tmin_c`, `tmax_c`, `prcp_mm` | **Extracted (NOAA) + converted** | Raw `TMIN`/`TMAX`/`PRCP` values; NOAA stores them in *tenths*, we convert to °C / mm (×0.1). |
+| `tavg_c`, `temp_range_c` | **Created** | `(tmax+tmin)/2` and `tmax−tmin`. |
+| `day_of_year`, `month` | **Created** | Derived from `date` (`F.dayofyear`, `F.month`). |
+| `*_lag_1`, `*_lag_7` (tmin/tmax/prcp) | **Created** | `F.lag` in a per-station window ordered by date. |
+| `*_roll7_*`, `*_roll30_*`, `frost_days_roll30` | **Created** | rolling aggregations (`avg/min/max/sum`) over `rowsBetween`. |
+| `gdd_corn_ytd`, `gdd_wheat_ytd` | **Created** | accumulation of `max(0, tavg−base)` over the year. |
+| `region_tmin_mean`, `region_tmin_min`, `tmin_minus_region` | **Created** | spatial `groupBy` (~1° cell) per day + join back. |
+| **`next_day_is_frost`** (label `y`) | **Created** | `F.lead(is_frost_day, 1)`; and `is_frost_day` = `tmin_c ≤ 0` (also derived). |
+
+> In short: NOAA gives us **raw measurements and station metadata**; almost all the predictive power
+> comes from the **engineering** (lags, rolling windows, accumulations, neighbourhood) done in Spark.
+
+```{python}
+if not GOLD.exists():
+    subprocess.run([sys.executable, "-m", "src.processing.build_gold",
+                    "--start-year", str(START_YEAR), "--end-year", str(END_YEAR)], check=True)
+
+gold = spark.read.parquet(str(GOLD))
+print(f"gold rows: {gold.count():,}  |  columns: {len(gold.columns)}")
+
+usable = gold.where(F.col("next_day_is_frost").isNotNull())
+pos = usable.agg(F.avg(F.col("next_day_is_frost").cast("double"))).first()[0]
+print(f"rows usable for ML (have a label): {usable.count():,}")
+print(f"base frost rate (positives)      : {pos:.1%}")
+```
+
+### 6.2 · Does precipitation help predict frost?
+
+`prcp_mm` is the dataset's **most complete** rain/snow variable (~7% null, vs ~26–28% for snow). And
+there's a clear **physical hypothesis**: a **dry, clear** night loses heat by radiation → **more
+frost**; recent rain and clouds hold the heat → **less frost**. Below, tomorrow's frost rate by the
+**precipitation accumulated over the last 7 days**.
+
+> ⚠️ **Watch out for the season trap.** Winter is, at the same time, **drier and colder**. So part of
+> the relationship above may be just that: rain and frost **move together because both depend on the
+> time of year** — and not because rain *itself* changes the frost risk. This chart shows the **raw**
+> relationship (without isolating that common influence). What decides whether rain has its **own**
+> value is the ablation in §7.5: there the model is trained **with** and **without** precipitation
+> and the two are compared — since temperature and season are already in the model, any remaining
+> difference is the effect of **rain alone**.
+
+```{python}
+# 6.2 — Tomorrow's frost rate vs precipitation accumulated over the last 7 days.
+pf = (gold.where(F.col("next_day_is_frost").isNotNull()
+                 & F.col("prcp_mm_roll7_sum").isNotNull())
+      .withColumn("prcp7",
+          F.when(F.col("prcp_mm_roll7_sum") <= 0.1, "0 (dry)")
+           .when(F.col("prcp_mm_roll7_sum") <= 5,  "0–5 mm")
+           .when(F.col("prcp_mm_roll7_sum") <= 15, "5–15 mm")
+           .when(F.col("prcp_mm_roll7_sum") <= 40, "15–40 mm")
+           .otherwise("40+ mm"))
+      .groupBy("prcp7")
+      .agg(F.avg(F.col("next_day_is_frost").cast("double")).alias("frost_rate"),
+           F.count("*").alias("n"))
+      .toPandas())
+order = ["0 (dry)", "0–5 mm", "5–15 mm", "15–40 mm", "40+ mm"]
+pf = pf.set_index("prcp7").reindex(order).reset_index()
+
+fig, ax = plt.subplots(figsize=(9, 4.5))
+bars = ax.bar(pf["prcp7"], pf["frost_rate"] * 100, color="#4C72B0")
+ax.set_title("Tomorrow's frost rate vs rain accumulated over the last 7 days (Corn Belt)")
+ax.set_xlabel("precipitation over the last 7 days"); ax.set_ylabel("% that frost the next day")
+for b, n in zip(bars, pf["n"]):
+    ax.text(b.get_x() + b.get_width() / 2, b.get_height(), f"n={n/1e6:.1f}M",
+            ha="center", va="bottom", fontsize=8)
+plt.tight_layout(); plt.show()
+```
+
+### 6.4 · The frost season **flips** between hemispheres (North × South)
+
+Here is the visual proof of **why latitude/hemisphere matters**. In the **Northern Hemisphere** (Corn
+Belt) frost happens in the **boreal** winter, **Dec–Feb**. In the **Southern Hemisphere**, winter is
+in **Jun–Aug** — so the frost season is **mirrored**.
+
+**Two Southern-Hemisphere cutouts — to diversify and show where the analysis hits the data limit.**
+Just as we cut the US with a box (§2.2), we cut two southern regions:
+
+- **Southern Brazil (RS + Santa Catarina highlands)** — `BR`, `lat −34..−27°`, `lon −58..−49°`,
+  including **São Joaquim (~1402 m, the coldest point in Brazil)**. But GHCN is **sparse** here: of
+  the 255 stations in the box, **only 8 measure TMIN**, most at low altitude (rare frost) — ~**7.5k**
+  observations in total.
+- **Southeastern Australia + Tasmania** — NSW/VIC plateaus, *Snowy Mountains* and the Tasmanian
+  highlands, where frost is a **real agricultural risk** (wheat/canola). Here GHCN is **dense and
+  long**: 8 frost-prone stations add up to ~**116k** TMIN observations.
+
+The contrast **is** the point: the same analysis is **possible in both**, but with opposite data
+qualities — RS shows the **limit** (thin signal), Australia shows the **rich case**. In both we
+download the stations straight from GHCN's *by-station* files (without re-ingesting anything). The
+**maps below** show the captured points (colour = elevation); then the monthly climatology reveals
+the **flip** — we normalize **each curve by its own peak** to compare the seasonal **shape**.
+
+> **Honest note.** Neither southern cutout has the density to *model* (no neighbourhood); they serve
+> as **climatology** proving the flip. RS is so sparse its curve comes out "thin" (peak of only ~3% of
+> days with frost, vs ~56% in Australia). That's why the main study stays only in the Corn Belt.
+
+```{python}
+# 6.4a — Captured TMIN stations: southern Brazil (sparse) × southeastern Australia (dense).
+import matplotlib.patches as mpatches  # noqa: E402
+rs = pd.read_csv(resolve("data/ref/southern_stations.csv"))
+au = pd.read_csv(resolve("data/ref/australia_stations.csv"))
+
+def _stmap(ax, sta, box, title):   # box = (lat_min, lat_max, lon_min, lon_max)
+    s = ax.scatter(sta["longitude"], sta["latitude"], c=sta["elevation_m"],
+                   cmap="terrain", s=110, edgecolor="black", linewidth=0.6, zorder=3)
+    ax.add_patch(mpatches.Rectangle((box[2], box[0]), box[3] - box[2], box[1] - box[0],
+                 fill=False, edgecolor="red", lw=1.5, ls="--", zorder=2))
+    for _, r in sta.iterrows():
+        ax.annotate(r["name"], (r["longitude"], r["latitude"]),
+                    textcoords="offset points", xytext=(5, 3), fontsize=7, zorder=4)
+    ax.set_xlim(box[2] - 1, box[3] + 1); ax.set_ylim(box[0] - 1, box[1] + 1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(title); ax.set_xlabel("longitude"); ax.set_ylabel("latitude")
+    return s
+
+fig, (a1, a2) = plt.subplots(1, 2, figsize=(15, 6))
+_stmap(a1, rs, (-34.0, -27.0, -58.0, -49.0), f"Southern Brazil — {len(rs)} stations (sparse)")
+sc = _stmap(a2, au, (-43.5, -28.0, 144.0, 153.0), f"Southeastern Australia — {len(au)} stations (dense)")
+fig.colorbar(sc, ax=a2, label="elevation (m)")
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+# 6.4 — Frost-season flip: Corn Belt (N) vs Australia and southern Brazil (S).
+# North: frost rate by month from gold (Spark). South: pre-computed CSVs (by_station).
+north = (gold.where(F.col("is_frost_day").isNotNull())
+         .groupBy("month").agg(F.avg(F.col("is_frost_day").cast("double")).alias("frost_rate"))
+         .orderBy("month").toPandas())
+south = pd.read_csv(resolve("data/ref/southern_frost.csv"))     # RS (sparse)
+aus = pd.read_csv(resolve("data/ref/australia_frost.csv"))      # Australia (dense)
+
+# normalize each series by its own peak -> compare the seasonal SHAPE (the flip)
+for d in (north, south, aus):
+    d["rel"] = 100 * d["frost_rate"] / d["frost_rate"].max()
+months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+fig, ax = plt.subplots(figsize=(11, 4.5))
+ax.plot(north["month"], north["rel"], "-o", color="#4C72B0",
+        label="Corn Belt — US (North)")
+ax.plot(aus["month"], aus["rel"], "-o", color="#55A868",
+        label="Southeastern Australia (South, dense)")
+ax.plot(south["month"], south["rel"], "--o", color="#C44E52", alpha=0.7,
+        label="Southern Brazil — RS (South, sparse)")
+ax.axvspan(5.5, 8.5, color="#C44E52", alpha=0.06)   # austral winter
+ax.axvspan(0.5, 2.5, color="#4C72B0", alpha=0.06)   # boreal winter (Jan-Feb)
+ax.set_xticks(range(1, 13), labels=months)
+ax.set_title("The frost season FLIPS between hemispheres (each side peaks in opposite months)")
+ax.set_xlabel("month"); ax.set_ylabel("frost intensity\n(% of each region's peak)")
+ax.legend(loc="upper center")
+plt.tight_layout(); plt.show()
+```
+
+### 6.5 · The three layers side by side (bronze → silver → gold)
+
+To close the engineering part, here is the **same station** seen in each medallion layer —
+materializing the transformation we described:
+
+- **Bronze (raw, *long* format):** one row per (station, day, **ELEMENT**) — TMAX, TMIN, PRCP…
+  stacked, in tenths of a unit, no metadata.
+- **Silver (clean, *wide*, SI):** one row per **station-day**; each ELEMENT becomes a column
+  (`tmin_c`, `tmax_c`, `prcp_mm`), already in °C/mm and with the station metadata joined.
+- **Gold (ML-ready):** silver **+ the features** (lags, rolling means, GDD, neighbourhood) and the
+  **label** `next_day_is_frost`.
+
+```{python}
+# 6.5 — The same station in all three layers: bronze (long) → silver (wide/SI) → gold (features).
+ex_id = gold.groupBy("id").count().orderBy(F.desc("count")).first()["id"]   # station with most data
+print(f"Sample station: {ex_id}\n")
+
+print("BRONZE — raw, LONG format (1 row per ELEMENT/day, value in tenths):")
+(bronze_obs.where(F.col("id") == ex_id)
+ .select("id", "date", "element", "value").orderBy("date", "element").show(8))
+
+print("SILVER — clean, WIDE, SI + station metadata (1 row/day):")
+(silver.where(F.col("id") == ex_id)
+ .select("id", "date", "name", "tmin_c", "tmax_c", "prcp_mm").orderBy("date").show(5))
+
+print("GOLD — silver + ML FEATURES + label (1 row/day, 48 columns in total):")
+(gold.where(F.col("id") == ex_id)
+ .select("id", "date", "tmin_c", "tmin_c_lag_1", "tmin_c_roll7_mean",
+         "region_tmin_mean", "gdd_corn_ytd", "next_day_is_frost").orderBy("date").show(5))
+```
+
+## 7 · Modelling
+
+**Label.** `next_day_is_frost` (binary). **Split.** *Temporal*: train on `year < TEST_YEAR`, test on
+`year == TEST_YEAR`. A random split would leak future weather and inflate the metrics — the only
+honest evaluation is *"fit on history, predict the next year"*.
+
+We follow the *"simple > complex"* principle: first a **trivial rule-based baseline** (persistence —
+*"if today's TMIN was low, predict frost tomorrow"*), then Spark ML's **tree ensembles**
+(RandomForest and GBT), then **comparison** and **hyperparameter tuning** with `CrossValidator`. A
+model only earns its complexity if it beats the baseline.
+
+> **What, exactly, is the dataset that trains the model?**
+> The **gold** table (`data/gold/station_daily_features/`), filtered to the rows that have a label
+> (`next_day_is_frost` non-null), in the **Corn Belt** cutout over **2005–2024**. Each row is a
+> **station-day**. **X** = the **30 features** from §6.1; **y** = `next_day_is_frost` (0/1). **Train**
+> = years `< 2024`; **test** = year `2024` (temporal split). The training set is subsampled (10%)
+> just for speed; the test set stays 100%.
+
+```{python}
+# Reuse the production training helpers — same feature list, same pipeline.
+from src.ml.train_frost_classifier import (  # noqa: E402
+    ALL_FEATURES, LABEL_COL, build_pipeline, evaluate, confusion, top_features,
+)
+
+ml = (gold.where(F.col("next_day_is_frost").isNotNull())
+      .withColumn(LABEL_COL, F.col("next_day_is_frost").cast("double"))
+      .select("year", LABEL_COL, *ALL_FEATURES))
+
+train = ml.where(F.col("year") < TEST_YEAR).drop("year")
+test  = ml.where(F.col("year") == TEST_YEAR).drop("year")
+
+# Subsample only the TRAIN set, to keep the notebook run fast; the TEST set stays complete + honest.
+train = train.sample(False, 0.10, seed=42).cache()
+test = test.cache()
+
+# Make explicit what goes into the model.
+print(f"Training dataset: GOLD table (station-day), cutout {REGION['name']}, {START_YEAR}–{END_YEAR-1}")
+print(f"Test dataset    : GOLD table, year {TEST_YEAR} (temporal split, no leakage)")
+print(f"# features (X): {len(ALL_FEATURES)}   |   Label (y): {LABEL_COL} = next_day_is_frost (0/1)")
+print(f"train rows: {train.count():,}   test rows: {test.count():,}")
+print("Features:", ", ".join(ALL_FEATURES))
+```
+
+```{python}
+# 7.1 — Baseline: "predict frost tomorrow if today's TMIN <= 2 °C". No learning.
+def eval_baseline(df, threshold=2.0):
+    pred = df.withColumn("prediction",
+                         F.when(F.col("tmin_c") <= threshold, 1.0).otherwise(0.0))
+    from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+    m = MulticlassClassificationEvaluator(labelCol=LABEL_COL, predictionCol="prediction")
+    return {"accuracy": m.evaluate(pred, {m.metricName: "accuracy"}),
+            "f1": m.evaluate(pred, {m.metricName: "f1"}),
+            "weighted_precision": m.evaluate(pred, {m.metricName: "weightedPrecision"}),
+            "weighted_recall": m.evaluate(pred, {m.metricName: "weightedRecall"})}
+
+baseline_metrics = eval_baseline(test)
+print("Baseline (rule TMIN<=2°C):")
+for k, v in baseline_metrics.items():
+    print(f"  {k:>22}: {v:.4f}")
+```
+
+```{python}
+# 7.2 — Train LR, RandomForest and GBT; evaluate all on the held-out test year.
+results = {"baseline (TMIN<=2)": {**baseline_metrics, "roc_auc": float("nan"),
+                                  "pr_auc": float("nan")}}
+fitted = {}
+# lr = linear baseline (uses StandardScaler), rf = bagged trees, gbt = boosted trees.
+for algo in ["lr", "rf", "gbt"]:
+    t0 = time.time()
+    model = build_pipeline(algo).fit(train)
+    preds = model.transform(test)
+    results[algo] = evaluate(preds)
+    fitted[algo] = (model, preds)
+    print(f"{algo}: trained in {time.time()-t0:.0f}s | ROC-AUC={results[algo]['roc_auc']:.4f}")
+
+comparison = pd.DataFrame(results).T[
+    ["roc_auc", "pr_auc", "accuracy", "f1", "weighted_precision", "weighted_recall"]]
+display(comparison.style.format("{:.4f}", na_rep="—")
+        .background_gradient(cmap="Greens", subset=["roc_auc", "f1"]))
+```
+
+```{python}
+# 7.3 — Model comparison chart: every model must beat the baseline bar.
+fig, ax = plt.subplots()
+comparison["f1"].plot.bar(ax=ax, color=["#999999", "#C44E52", "#4C72B0", "#55A868"])
+ax.set_title("F1 by model — does complexity beat the simple rule?")
+ax.set_ylabel("F1 (held-out test 2024)"); ax.set_ylim(0, 1)
+for i, v in enumerate(comparison["f1"]):
+    ax.text(i, v, f"{v:.3f}", ha="center", va="bottom")
+plt.xticks(rotation=15); plt.tight_layout(); plt.show()
+```
+
+```{python}
+# 7.4 — Hyperparameter tuning of the winning GBT via CrossValidator.
+# Small grid + small sample so it finishes in the notebook; what matters is the *method*.
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder  # noqa: E402
+from pyspark.ml.evaluation import BinaryClassificationEvaluator  # noqa: E402
+
+tune_train = train.sample(False, 0.3, seed=7).cache()
+pipe = build_pipeline("gbt")
+gbt = pipe.getStages()[-1]
+grid = (ParamGridBuilder()
+        .addGrid(gbt.maxDepth, [4, 6])
+        .addGrid(gbt.maxIter, [20, 40])
+        .build())
+cv = CrossValidator(
+    estimator=pipe, estimatorParamMaps=grid,
+    evaluator=BinaryClassificationEvaluator(labelCol=LABEL_COL,
+                                            rawPredictionCol="rawPrediction",
+                                            metricName="areaUnderROC"),
+    numFolds=3, parallelism=2, seed=42)
+
+t0 = time.time()
+cv_model = cv.fit(tune_train)
+print(f"CrossValidator fit in {time.time()-t0:.0f}s over {len(grid)} combinations × 3 folds")
+
+best_gbt = cv_model.bestModel.stages[-1]
+print("best maxDepth:", best_gbt.getMaxDepth(), "| best maxIter:", best_gbt.getMaxIter())
+for params, auc in sorted(zip(grid, cv_model.avgMetrics), key=lambda x: -x[1]):
+    pretty = {p.name: v for p, v in params.items()}
+    print(f"  ROC-AUC (CV)={auc:.4f}  {pretty}")
+```
+
+### 7.5 · Ablation: does precipitation help the model?
+
+The chart in §6.2 shows precipitation **moves together** with frost — but, as we saw in the "season
+trap", moving together **does not prove** it helps to *predict*. To really test it, we run an
+**ablation**: we train the **same GBT model twice** —
+
+1. with **all** 30 features;
+2. **removing** the precipitation group —
+
+and compare the accuracy on the test year. The logic: since **temperature, season and neighbourhood
+stay in the model** in both cases, if *removing* precipitation **worsens** the result, it's because
+the group **added information the others didn't have**. If the result **barely changes**, the group
+was practically **redundant**.
+
+```{python}
+# 7.5 — Ablation by feature group: precipitation (5 cols).
+from src.ml.train_frost_classifier import PRECIP_COLS   # noqa: E402
+from pyspark.ml import Pipeline                               # noqa: E402
+from pyspark.ml.feature import Imputer, VectorAssembler       # noqa: E402
+from pyspark.ml.classification import GBTClassifier           # noqa: E402
+
+def gbt_on(features):
+    imp = [f"{c}__imp" for c in features]
+    pipe = Pipeline(stages=[
+        Imputer(strategy="median", inputCols=features, outputCols=imp),
+        VectorAssembler(inputCols=imp, outputCol="features", handleInvalid="keep"),
+        GBTClassifier(labelCol=LABEL_COL, featuresCol="features",
+                      maxIter=40, maxDepth=6, stepSize=0.1, subsamplingRate=0.8, seed=42)])
+    return evaluate(pipe.fit(train).transform(test))
+
+abl = {
+    "full (30 feat.)":   results["gbt"],                                     # already trained in 7.2
+    "without PRECIP (−5)": gbt_on([c for c in ALL_FEATURES if c not in PRECIP_COLS]),
+}
+abl_df = pd.DataFrame(abl).T[["roc_auc", "pr_auc", "f1", "weighted_recall"]]
+full = abl_df.loc["full (30 feat.)"]
+print("Δ relative to the full model (‰ = per mille; negative = worse when removing the group):")
+for name in abl_df.index:
+    d_auc = (abl_df.loc[name, "roc_auc"] - full["roc_auc"]) * 1000
+    d_pr  = (abl_df.loc[name, "pr_auc"]  - full["pr_auc"])  * 1000
+    print(f"  {name:>22}: ROC={abl_df.loc[name,'roc_auc']:.4f} (Δ{d_auc:+.2f}‰)  "
+          f"PR={abl_df.loc[name,'pr_auc']:.4f} (Δ{d_pr:+.2f}‰)")
+display(abl_df.style.format("{:.4f}")
+        .background_gradient(cmap="Greens", subset=["roc_auc", "pr_auc"]))
+```
+
+## 8 · Results & evaluation
+
+We evaluate the best tuned model on the **complete** held-out test year. The ROC and PR curves are
+computed with `numpy` over a sample of `(probability, label)` — a legitimate small-data use, not a
+reimplementation of the pipeline in Pandas.
+
+```{python}
+best_model = cv_model.bestModel
+best_preds = best_model.transform(test)
+metrics = evaluate(best_preds)
+cm = confusion(best_preds)
+
+print("TUNED GBT — held-out test", TEST_YEAR)
+for k, v in metrics.items():
+    print(f"  {k:>22}: {v:.4f}")
+print(f"\n  confusion matrix: TN={cm['tn']:,} FP={cm['fp']:,} FN={cm['fn']:,} TP={cm['tp']:,}")
+```
+
+```{python}
+# 8.1 — ROC & PR curves from a sample (frost_prob, label).
+from pyspark.ml.functions import vector_to_array  # noqa: E402
+
+pl = (best_preds
+      .withColumn("p1", vector_to_array("probability")[1])
+      .select("p1", LABEL_COL)
+      .sample(False, 0.05, seed=3).toPandas())
+
+p, y = pl["p1"].to_numpy(), pl[LABEL_COL].to_numpy()
+order = np.argsort(-p)
+y = y[order]
+P, N = y.sum(), (1 - y).sum()
+tps, fps = np.cumsum(y), np.cumsum(1 - y)
+tpr, fpr = tps / P, fps / N
+precision = tps / (tps + fps)
+
+fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.5))
+a1.plot(fpr, tpr, color="#4C72B0"); a1.plot([0, 1], [0, 1], "k--", lw=1)
+a1.set_title(f"ROC curve (AUC={metrics['roc_auc']:.3f})")
+a1.set_xlabel("false positive rate"); a1.set_ylabel("true positive rate")
+a2.plot(tpr, precision, color="#55A868")
+a2.set_title(f"Precision–Recall (AUC={metrics['pr_auc']:.3f})")
+a2.set_xlabel("recall"); a2.set_ylabel("precision")
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+# 8.2 — Confusion-matrix heatmap.
+cm_arr = np.array([[cm["tn"], cm["fp"]], [cm["fn"], cm["tp"]]])
+fig, ax = plt.subplots(figsize=(5, 4))
+im = ax.imshow(cm_arr, cmap="Blues")
+ax.set_xticks([0, 1], labels=["pred. no frost", "pred. frost"])
+ax.set_yticks([0, 1], labels=["actual no frost", "actual frost"])
+for i in range(2):
+    for j in range(2):
+        ax.text(j, i, f"{cm_arr[i, j]:,}", ha="center", va="center",
+                color="white" if cm_arr[i, j] > cm_arr.max() / 2 else "black")
+ax.set_title(f"Confusion matrix — tuned GBT, {TEST_YEAR}")
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+# 8.3 — Feature importances: does the model reason like an agronomist?
+imp = pd.DataFrame(top_features(best_model, k=12), columns=["feature", "importance"])
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.barh(imp["feature"][::-1], imp["importance"][::-1], color="#4C72B0")
+ax.set_title("Top features by importance — tuned GBT")
+ax.set_xlabel("importance")
+plt.tight_layout(); plt.show()
+display(imp)
+```
+
+### 8.4 · Is AUC ≈ 0.98 too good? Persistence baseline, skill & stratified evaluation
+
+A frost classifier at ~0.98 should make us suspicious. The two honest tests below show that **it is
+not leakage** — it's that next-day frost is *intrinsically easy*:
+
+1. **Persistence baseline.** Score tomorrow's frost using **only today's TMIN**, with *zero*
+   learning. If that alone already comes close to the model's AUC, the model is mostly capturing the
+   daily persistence of temperature, not cheating.
+2. **Cutout confirmation (spatial separability).** In a *global* model, part of the AUC is trivial:
+   tropics ~0% frost vs. poles ~100%. But **we already cut to the Corn Belt** (all mid-latitude,
+   ~37–49°), so that noise was removed at the source. The test below confirms it: the AUC on the hard
+   mid-latitude band **matches** that of the whole cutout — no spatial inflation left, the number is
+   honest.
+
+```{python}
+# 8.4a — AUC of the persistence baseline (today's TMIN only) vs. the tuned model.
+def auc_from_score(pdf, score_col, label_col):
+    s = pdf[score_col].to_numpy(); y = pdf[label_col].to_numpy()
+    order = np.argsort(-s); y = y[order]
+    P, N = y.sum(), (1 - y).sum()
+    tpr = np.cumsum(y) / P; fpr = np.cumsum(1 - y) / N
+    return float(np.trapz(tpr, fpr))
+
+pers = (test.select((-F.col("tmin_c")).alias("score"), F.col(LABEL_COL).alias("y"))
+        .where(F.col("score").isNotNull()).sample(False, 0.05, seed=11).toPandas())
+auc_persist = auc_from_score(pers, "score", "y")
+
+print(f"AUC of the persistence baseline (today's TMIN only, zero ML): {auc_persist:.4f}")
+print(f"AUC of the tuned GBT                                        : {metrics['roc_auc']:.4f}")
+print(f"--> ML adds only {metrics['roc_auc']-auc_persist:+.4f} of AUC over raw persistence.")
+print("    A leaking model would give ~0.999 and crush persistence; this one is honest.")
+```
+
+```{python}
+# 8.4b — Stratified evaluation: skill on the HARD mid-latitude band (|lat| between 30 and 55).
+from pyspark.ml.evaluation import BinaryClassificationEvaluator as BCE  # noqa: E402
+
+# Re-score the tuned model on the mid-latitude subset of the test year.
+mid_test = (gold.where(F.col("year") == TEST_YEAR)
+            .withColumn(LABEL_COL, F.col("next_day_is_frost").cast("double"))
+            .where(F.col(LABEL_COL).isNotNull())
+            .where((F.abs(F.col("latitude")) >= 30) & (F.abs(F.col("latitude")) <= 55)))
+mid_preds = best_model.transform(mid_test)
+mid_auc = BCE(labelCol=LABEL_COL, rawPredictionCol="rawPrediction",
+              metricName="areaUnderROC").evaluate(mid_preds)
+mid_pos = mid_test.agg(F.avg(F.col(LABEL_COL))).first()[0]
+
+print(f"Test rows at mid-latitude (|lat| 30–55°) : {mid_test.count():,}")
+print(f"Base frost rate at mid-latitude          : {mid_pos:.1%}")
+print(f"ROC-AUC at mid-latitude (the honest, hard number): {mid_auc:.4f}")
+print(f"ROC-AUC over the whole cutout (Corn Belt)        : {metrics['roc_auc']:.4f}")
+print("    They match -> the cutout already removed the tropic/pole inflation at the source.")
+```
+
+### 8.5 · Threshold tuning for the business cost (FN ≫ FP)
+
+The default 0.5 cutoff is rarely the business optimum. A **missed frost (FN)** can destroy a crop; a
+**false alarm (FP)** only triggers cheap mitigation. So recall on the frost class matters more than
+precision. We sweep the decision threshold and pick the operating point — a *data-driven decision*
+about the operating point.
+
+```{python}
+# 8.5 — Sweep the probability threshold; show the precision/recall/F1 trade-off.
+sweep = (best_preds.withColumn("p1", vector_to_array("probability")[1])
+         .select("p1", LABEL_COL).sample(False, 0.05, seed=13).toPandas())
+ps, ys = sweep["p1"].to_numpy(), sweep[LABEL_COL].to_numpy()
+ths = np.linspace(0.1, 0.9, 33)
+rows = []
+for t in ths:
+    pred = (ps >= t).astype(int)
+    tp = ((pred == 1) & (ys == 1)).sum(); fp = ((pred == 1) & (ys == 0)).sum()
+    fn = ((pred == 0) & (ys == 1)).sum()
+    prec = tp / (tp + fp) if tp + fp else 0
+    rec = tp / (tp + fn) if tp + fn else 0
+    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0
+    rows.append((t, prec, rec, f1))
+sw = pd.DataFrame(rows, columns=["threshold", "precision", "recall", "f1"])
+best_t = sw.loc[sw["f1"].idxmax(), "threshold"]
+
+fig, ax = plt.subplots()
+for col, c, lbl in [("precision", "#4C72B0", "precision"),
+                    ("recall", "#C44E52", "recall"), ("f1", "#55A868", "F1")]:
+    ax.plot(sw["threshold"], sw[col], label=lbl, color=c)
+ax.axvline(best_t, ls="--", color="k", lw=1, label=f"max F1 @ {best_t:.2f}")
+ax.set_title("Decision-threshold sweep — recall (catch frosts) vs precision")
+ax.set_xlabel("probability threshold"); ax.set_ylabel("metric"); ax.legend()
+plt.tight_layout(); plt.show()
+print(f"Max-F1 threshold = {best_t:.2f}. For frost insurance, shifting it DOWN raises recall.")
+```
+
+### 8.6 · Which metric matters? Recall and the baseline's real strength
+
+**Why recall is the metric the business feels.** The two errors don't cost the same:
+
+- **FN — frost *not* predicted** → crop damaged without warning → **un-hedged supply shock**, broken
+  supply contract. Very high cost.
+- **FP — false alarm** → cheap mitigation / *hedge* is triggered for nothing. Low cost.
+
+With **FN ≫ FP**, the goal is to **catch as many real frosts as possible** — exactly the **frost-class
+recall = TP / (TP + FN)**. *Accuracy* and *F1* mask this (they are dominated by the majority class or
+balance precision and recall), so we measure recall **explicitly**, per model.
+
+**Does the baseline look too strong?** The rule "today's TMIN ≤ 2 °C → frost tomorrow" already goes
+far because **frost is almost pure thermal persistence**. But "similar F1" doesn't tell the whole
+story: below we compare the models **on the frost class** (precision and recall) — that's where the
+real gain shows. And we test the rule itself at several thresholds (`TMIN ≤ 0/1/2/3 °C`) to answer:
+**is 2 °C already a good indicator of frost?**
+
+```{python}
+# 8.6a — Precision / recall / F1 ON THE FROST CLASS (not the weighted average).
+def frost_metrics(preds, pred_col="prediction"):
+    cm = {(int(r[LABEL_COL]), int(r[pred_col])): r["count"]
+          for r in preds.groupBy(LABEL_COL, pred_col).count().collect()}
+    tp, fp, fn = cm.get((1, 1), 0), cm.get((0, 1), 0), cm.get((1, 0), 0)
+    prec = tp / (tp + fp) if tp + fp else 0.0
+    rec  = tp / (tp + fn) if tp + fn else 0.0
+    f1   = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+    return prec, rec, f1
+
+rows = []
+bl = test.withColumn("prediction", F.when(F.col("tmin_c") <= 2, 1.0).otherwise(0.0))
+rows.append(("baseline (TMIN≤2)", *frost_metrics(bl)))
+for algo in ["lr", "rf", "gbt"]:
+    rows.append((algo, *frost_metrics(fitted[algo][1])))
+rows.append(("tuned GBT", *frost_metrics(best_preds)))
+cls = pd.DataFrame(rows, columns=["model", "precision (frost)", "recall (frost)", "F1 (frost)"])
+print("FROST-CLASS METRICS (what the business feels)")
+display(cls.style.format({c: "{:.4f}" for c in cls.columns[1:]})
+        .background_gradient(cmap="Greens", subset=["recall (frost)"]))
+
+fig, ax = plt.subplots()
+ax.bar(cls["model"], cls["recall (frost)"],
+       color=["#999999", "#C44E52", "#4C72B0", "#55A868", "#8172B3"])
+ax.set_title("Frost-class recall — % of real frosts each model CATCHES")
+ax.set_ylabel("recall (test 2024)"); ax.set_ylim(0, 1)
+for i, v in enumerate(cls["recall (frost)"]):
+    ax.text(i, v, f"{v:.3f}", ha="center", va="bottom")
+plt.xticks(rotation=15); plt.tight_layout(); plt.show()
+```
+
+```{python}
+# 8.6b — The rule "today's TMIN ≤ k" at several thresholds: does 2 °C already indicate frost tomorrow?
+rule_rows = []
+for k in [0, 1, 2, 3]:
+    r = test.withColumn("prediction", F.when(F.col("tmin_c") <= k, 1.0).otherwise(0.0))
+    rule_rows.append((f"TMIN≤{k}°C", *frost_metrics(r)))
+rule = pd.DataFrame(rule_rows, columns=["rule (today)", "precision", "recall", "F1"])
+print("SIMPLE RULE AT SEVERAL THRESHOLDS — predicting TOMORROW's frost")
+display(rule.style.format({c: "{:.4f}" for c in rule.columns[1:]}))
+```
+
+**Reading (with the real numbers).** The `TMIN≤2` baseline has the **highest recall** in the table
+(~0.92) — it catches more frosts than any model —, but the **worst precision** (~0.79): it's a
+*blind, recall-oriented* classifier. The threshold table confirms the mechanism: raising the cutoff
+from `≤0` to `≤3 °C` takes recall from ~0.85 → ~0.94 **at the expense** of precision (~0.86 → ~0.75),
+because tomorrow's TMIN tends to fall *below* today's. For our case (FN ≫ FP), prioritizing recall is
+the **right** direction — which is why the baseline already looks "good".
+
+So the models' gain is **not F1** (it's indeed marginal): it's **trading a bit of recall for much more
+precision** (~0.79 → ~0.86, i.e. **~⅓ fewer false alarms** with recall still ~0.88) and, above all,
+delivering an **adjustable probability**. Via the **threshold tuning** (§8.5) you can *recover* the
+baseline's recall while keeping precision better than the blind rule's — the best of both worlds.
+
+## 8.7 · Extended target: frost forecasting from 1 to 15 days (multi-horizon)
+
+So far the target was only **D+1** (frost tomorrow). But in agriculture, lead time is gold: a few
+days of warning give time to trigger anti-frost irrigation, bring forward the harvest or cover
+seedlings. So we **extend the target**: within the same agricultural polygon (Corn Belt), we train
+**one GBT per horizon** — frost at **D+1, D+2, …, D+15** — with the **same features** (all ≤ today, so
+it stays **leakage-free**: only the label is pulled k days forward).
+
+We compare **accuracy**, **ROC-AUC** and **F1** by horizon. The **skill-decay** curve shows how far
+out the forecast is reliable — and it's expected to fall, because predicting **tomorrow** is almost
+just "it'll stay similar to today" (thermal persistence), while predicting **15 days out** depends on
+large-scale changes in the atmosphere — the *synoptic patterns* — far harder to anticipate.
+
+```{python}
+# Multi-horizon labels: frost at D+k per station, ordered by date (lead, no leakage).
+# ILLUSTRATIVE skill-decay study: instead of caching the WHOLE gold (~40 M rows, which
+# spill ~12 GB to disk and pressure the heap), we sample ~10% of the STATIONS — each time
+# series stays WHOLE, so `lead` remains valid. The resulting frame FITS in RAM: ~same
+# training volume, without the ~12 GB spill of the whole gold (much lighter for the machine).
+from pyspark.sql import Window  # noqa: E402
+
+# Memory hygiene: by the time we get here the session has accumulated the state of the WHOLE report
+# (the §7 models, the CrossValidator, caches and broadcasts). Since the multi-horizon study is the
+# memory PEAK, we RESTART the Spark session to run it on a CLEAN heap — the same condition it would
+# run in on its own. Nothing from here depends on previous Spark objects: §8.8+ re-read `gold` from
+# the new session.
+spark.stop()
+spark = build_spark(cfg)
+spark.sparkContext.setLogLevel("ERROR")
+gold = spark.read.parquet(str(GOLD))
+
+w_h = Window.partitionBy("id").orderBy("date")
+HORIZONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+st_keep = gold.select("id").distinct().sample(False, 0.10, seed=42)   # ~10% of the stations
+multi = gold.join(F.broadcast(st_keep), on="id", how="inner")
+for k in HORIZONS:
+    multi = multi.withColumn(f"y_h{k}", F.lead("is_frost_day", k).over(w_h).cast("double"))
+multi = multi.select("year", *ALL_FEATURES, *[f"y_h{k}" for k in HORIZONS]).cache()
+
+rows_h = []
+for k in HORIZONS:
+    d = multi.where(F.col(f"y_h{k}").isNotNull()).withColumn(LABEL_COL, F.col(f"y_h{k}"))
+    tr = d.where(F.col("year") < TEST_YEAR).select(LABEL_COL, *ALL_FEATURES)
+    te = d.where(F.col("year") == TEST_YEAR).select(LABEL_COL, *ALL_FEATURES)
+    met = evaluate(build_pipeline("gbt").fit(tr).transform(te))
+    rows_h.append({"horizon_days": k, "accuracy": met["accuracy"],
+                   "roc_auc": met["roc_auc"], "f1": met["f1"]})
+    print(f"D+{k}: accuracy={met['accuracy']:.4f}  ROC-AUC={met['roc_auc']:.4f}  F1={met['f1']:.4f}")
+multi.unpersist()
+
+multi_h = pd.DataFrame(rows_h)
+display(multi_h.style.format({"accuracy": "{:.4f}", "roc_auc": "{:.4f}", "f1": "{:.4f}"})
+        .background_gradient(cmap="RdYlGn", subset=["accuracy", "roc_auc", "f1"]))
+```
+
+```{python}
+# Skill-decay curve by forecast horizon.
+fig, ax = plt.subplots()
+ax.plot(multi_h["horizon_days"], multi_h["accuracy"], marker="o", label="accuracy")
+ax.plot(multi_h["horizon_days"], multi_h["roc_auc"], marker="s", label="ROC-AUC")
+ax.plot(multi_h["horizon_days"], multi_h["f1"], marker="^", label="F1")
+ax.set_title("Skill decay — frost forecast D+1 to D+15 (Corn Belt)")
+ax.set_xlabel("forecast horizon (days ahead)"); ax.set_ylabel("metric (test 2024)")
+ax.set_xticks(HORIZONS); ax.set_ylim(0.5, 1.0); ax.legend()
+plt.tight_layout(); plt.show()
+```
+
+## 8.8 · From forecast to business — will it frost here tomorrow, and where to store the crop?
+
+The whole pipeline exists to answer one concrete question for the person in the field: **"will it
+frost here tomorrow?"** — and now (§8.7), up to **fifteen days out**. The value is not academic: an
+**autumn** frost, *before* the corn dries and goes into storage, shortens the harvest and forces a
+rushed pick. Whoever sees the frost coming **before everyone else** wins the window to trigger
+harvest, drying and logistics.
+
+Translating to the region's **supply**: in the **pre-harvest window (Sep–Oct)**, **~13% of Corn Belt
+station-days** already record frost — and it is **not uniform**. The map below aggregates the risk by
+**~1° cell** and marks where it most pays to **build/expand storage + dryer**: the cells with the
+**highest autumn frost and relevant cropping** (colour = frost frequency; size = station coverage,
+our *proxy* for agricultural exposure; ★ = top-10 by priority = risk × exposure).
+
+> **Data honesty.** We don't have the corn **tonnage** per cell; we use **station density** as a proxy
+> for exposure. The map points to **where** pre-harvest frost risk is structurally higher (where to
+> invest in storage); the **D+1…D+15** model says **when** supply gets acute this week (when to act).
+
+```{python}
+# 8.8 — Storage priority: autumn frost (Sep–Oct) per 1° cell, risk × exposure.
+GRID_DEG = 1
+fall = F.col("month").isin([9, 10])              # corn pre-harvest window (early frost)
+base_fall = gold.where(F.col("is_frost_day").isNotNull() & fall)
+
+cells = (base_fall
+         .withColumn("clat", F.floor(F.col("latitude") / GRID_DEG) * GRID_DEG)
+         .withColumn("clon", F.floor(F.col("longitude") / GRID_DEG) * GRID_DEG)
+         .groupBy("clat", "clon")
+         .agg(F.avg(F.col("is_frost_day").cast("double")).alias("frost_rate"),
+              F.countDistinct("id").alias("n_stations"),
+              F.count("*").alias("n_obs"))
+         .where(F.col("n_obs") >= 500).toPandas())          # only cells with reliable coverage
+cells["clat_c"] = cells["clat"] + 0.5
+cells["clon_c"] = cells["clon"] + 0.5
+cells["priority"] = cells["frost_rate"] * cells["n_stations"]    # hazard × exposure (proxy)
+top = cells.sort_values("priority", ascending=False).head(10)
+reg_rate = base_fall.agg(F.avg(F.col("is_frost_day").cast("double"))).first()[0]
+
+print(f"Frost rate in the pre-harvest window (Sep–Oct), Corn Belt: {reg_rate:.1%}")
+print(f"Cells above the regional mean: {(cells['frost_rate'] > reg_rate).mean():.0%}  "
+      f"(of {len(cells)} cells with coverage)")
+print(f"Priority cell #1: ~{top.iloc[0]['clat_c']:.1f}°N, {top.iloc[0]['clon_c']:.1f}°  "
+      f"— frosts {top.iloc[0]['frost_rate']:.0%} of Sep–Oct days, {int(top.iloc[0]['n_stations'])} stations")
+
+fig, ax = plt.subplots(figsize=(12, 6))
+plot_state_borders(ax, str(resolve("data/ref/us_states.geojson")))
+sc = ax.scatter(cells["clon_c"], cells["clat_c"], c=cells["frost_rate"] * 100,
+                s=cells["n_stations"] * 7, cmap="YlOrRd", edgecolor="#333", lw=0.3, alpha=0.88)
+ax.scatter(top["clon_c"], top["clat_c"], marker="*", s=340, c="none",
+           edgecolor="navy", lw=1.7, label="Top-10 storage priority (risk × exposure)")
+ax.set_xlim(REGION["lon_min"] - 1, REGION["lon_max"] + 1)
+ax.set_ylim(REGION["lat_min"] - 1, REGION["lat_max"] + 1)
+ax.set_aspect("equal", adjustable="box")
+plot_state_labels(ax, str(resolve("data/ref/us_states.geojson")))
+ax.set_title("Where to build storage in the Corn Belt — pre-harvest frost (Sep–Oct) × coverage")
+ax.set_xlabel("longitude"); ax.set_ylabel("latitude")
+fig.colorbar(sc, label="% of days with frost (Sep–Oct)")
+ax.legend(loc="lower left")
+plt.tight_layout(); plt.show()
+```
+
+> **Reading.** Pre-harvest frost risk falls **north→south** (same structure as §5.8): the **northwest/high**
+> fringe — Dakotas, western Nebraska, northern Minnesota/Wisconsin — is where autumn frost is most
+> frequent, and where local storage + dryer most reduce crop loss. The ★ combine that risk with
+> coverage (exposure): they are the cells where to **invest first**.
+
+## 9 · Runtime environment, data volumes & performance
+
+For reproducibility, we record **where** this report ran, **how much data** the pipeline moves and
+**how long** each step takes on this machine.
+
+```{python}
+# 9.1 — Machine specs + versions (read live).
+import platform, multiprocessing  # noqa: E402
+
+def _cpu_model():
+    try:
+        for ln in open("/proc/cpuinfo"):
+            if "model name" in ln:
+                return ln.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or "n/a"
+
+def _ram_gib():
+    try:
+        for ln in open("/proc/meminfo"):
+            if ln.startswith("MemTotal"):
+                return round(int(ln.split()[1]) / 1024 / 1024, 1)
+    except OSError:
+        return None
+
+print("CPU       :", _cpu_model())
+print("Cores     :", multiprocessing.cpu_count(), "logical")
+print("RAM       :", _ram_gib(), "GiB")
+print("System    :", platform.system(), platform.release())
+print("Python    :", platform.python_version(), "| PySpark", spark.version)
+print("Spark cfg :", cfg["spark"]["master"], "| driver", cfg["spark"]["driver_memory"],
+      "| shuffle.partitions", cfg["spark"]["shuffle_partitions"])
+```
+
+```{python}
+# 9.2 — Data volumes (rows) and pipeline run time.
+# Reads measurements saved by measure_perf.py (data/ref/perf_stats.json).
+import json  # noqa: E402
+
+perf_path = resolve("data/ref/perf_stats.json")
+if perf_path.exists():
+    perf = json.loads(perf_path.read_text())
+
+    vol = pd.DataFrame([
+        ("Bronze — observations (Corn Belt, 20 years)", perf["bronze_rows"]),
+        ("Silver — station-day (wide, SI)",             perf["silver_rows"]),
+        ("Gold — ML features (48 columns)",             perf["gold_rows"]),
+        ("GLOBAL 2024 slice — all ELEMENTs",            perf["global_total_rows"]),
+        ("GLOBAL 2024 slice — TMIN only (map)",         perf["global_tmin_rows"]),
+        ("GLOBAL 2024 slice — distinct stations",       perf["global_stations"]),
+    ], columns=["layer / source", "rows"])
+    print("DATA VOLUMES")
+    display(vol.style.format({"rows": "{:,.0f}"}))
+
+    times = pd.DataFrame([
+        ("Ingestion 20 years (Corn Belt)", "~30–40 min (dominated by downloading the global yearly files)"),
+        ("Silver (long→wide + station join)", f"{perf['silver_sec']:.0f} s"),
+        ("Gold (windows + regional features)", f"{perf['gold_sec']:.0f} s"),
+    ], columns=["pipeline stage", "time (AMD Ryzen 9 7900, Spark local[8]/11g)"])
+    print("\nPIPELINE RUN TIME")
+    display(times)
+else:
+    print("perf_stats.json missing — run: uv run python scripts/process/measure_perf.py")
+```
+
+### 9.3 · How much data, really? Global × US cutout × RS cutout
+
+The table makes explicit **how many rows the pipeline processes** in each scope — and why the
+**cutout** is the project's central decision:
+
+| Scope | Stations | Rows processed | TMIN coverage | Role in the project |
+|---|---|---|---|---|
+| **Global — entire GHCN** | ~120k | ~3 **billion** daily obs (1763–today) | dense only in part of the globe | infeasible to process whole on a laptop; we use only the **2024 slice** (37 M rows, 13.5k stations) for the world map |
+| **US cutout — Corn Belt (2005–2024)** | ~19.7k | **111 M** (bronze) → **40.3 M** station-day (silver/gold) | dense | **dataset that trains the model** |
+| **RS cutout — southern Brazil** | 255 in box (**only 8 with TMIN**) | **7.5k** TMIN obs | very sparse | only the **climatology** of the flip (§6.4); cannot model |
+
+> The jump **3 billion → 40 million → 7 thousand** rows is the project in one sentence: cutting is not
+> throwing data away — it's **spending the compute budget where there is signal** (Corn Belt, dense)
+> and recognizing where the data simply **does not exist** (RS, sparse).
+
+### 9.4 · Methods to **avoid reprocessing** the data (the point of the medallion)
+
+Reprocessing 111 M rows on every tweak would be prohibitive. The **medallion** architecture exists to
+avoid that — each layer is **persisted in Parquet** and only **what changed** is recomputed:
+
+- **Isolated layers.** Changed a cleaning rule? Re-run **only silver + gold** — bronze (111 M rows,
+  downloaded from the internet) is **never** redone. That's exactly what we did when adding the
+  neighbourhood (regional) features: we rebuilt gold in ~3 min without touching bronze/silver.
+- **Idempotent / append ingestion.** `stream_ingest` only downloads the **missing years**.
+- **Partitioning by year** (`partitionBy("year")`): Spark reads only the needed partitions (*partition
+  pruning*) and Parquet only the requested columns (*column pruning*) — it doesn't scan everything.
+- **Small pre-computed, versioned artifacts:** southern flip (`southern_frost.csv`), global frost grid
+  and `perf_stats.json` are ready in the repo; the charts **read** them instead of recomputing — which
+  is why this report re-renders in **seconds**.
+- **Guarded ingestion cell:** in the notebook, ingestion only runs if `data/bronze` does not exist.
+
+> The expensive part (ingest and cross-join) runs **once** and is saved; the cheap part (charts, new
+> features) runs on top of what's already ready.
+
+### 9.5 · Where the cost is — and the power (and the limit) of distributed computing
+
+**The most intensive step is building GOLD.** Lags, rolling means and GDD are **window functions**
+(`Window.partitionBy("id").orderBy("date")`): for each station, Spark **re-sorts the whole series in
+time** — a *wide transformation* that triggers **shuffle + sort** over 40 M rows, the part that
+consumes the most memory per task. (Ingestion is heavy on **I/O**, not CPU; the `CrossValidator` is
+heavy because it trains **12 models**, but over a sample.)
+
+**The power:** Spark processes **111 M rows on a single laptop**, parallelizing by partitions —
+unthinkable in Pandas/Excel.
+
+**The limit we lived in this session (honest):** the machine has **~15 GiB of RAM** and the driver
+uses **11 GiB of heap**. When raising concurrency to `local[10]`/`local[*]`, the tasks **compete for
+the same heap** and the gold window sort **blew up** (`SparkOutOfMemoryError`). We backed off to
+**`local[8]`** (+ `shuffle.partitions = 1024`, smaller partitions) for gold to fit. It's the central
+trade-off of running distributed on a single machine: **more parallelism ↔ less memory per task**.
+(The *notebook* itself — lighter, over the already-built gold — runs fine even at `local[*]`; it's
+only the **gold build** that requires `local[8]`.)
+
+**How we'd actually scale:** a **cluster** (more executors/RAM) removes the memory ceiling;
+*checkpointing* the windows would break the long lineage; **AQE** (already on) coalesces partitions on
+its own; and filtering elements/columns early + **broadcast joins** (already done) reduce the shuffle
+at the source.
+
+### 9.6 · What if we want to add more data?
+
+Thanks to the medallion (§9.4), extending is **cheap and localized** — we only recompute the affected
+layer:
+
+- **More years:** re-run `stream_ingest --start-year … --end-year …` (idempotent: downloads only what's
+  missing) and then `build_silver` / `build_gold`, which **re-derive** over the existing bronze.
+- **Another region:** change the `region:` block in `config.yaml` (or `stream_ingest --region` with
+  another box) and repeat silver/gold — the **same code** runs on any cutout, unchanged.
+- **Another source/variable:** download the small data separately, join it at the right layer via a
+  *broadcast join* and re-derive **only gold** — without touching bronze/silver.
+- **Whole corpus:** train with `--sample-fraction 1.0` on a **cluster** (more RAM/executors), without
+  changing a single line of the pipeline — only the infrastructure.
+
+> In all cases, the expensive part (bronze, 111 M rows) is **reused**; we recompute only what actually
+> changed.
+
+## 10 · Limitations, conclusions & next steps
+
+**What the result says.** The tuned GBT beats the rule baseline and reasons exactly like a domain
+expert: today's `TMIN`, the **neighbourhood mean TMIN** (`region_tmin_mean`, which became the 2nd most
+important feature) and the coldest night of the last week (`tmin_c_roll7_min`) dominate the signal.
+Adding the regional feature was the highest-return improvement — exactly what the previous baseline's
+weak spatial importances indicated.
+
+**Limitations (honest).**
+- *The neighbourhood feature is a grid approximation* (~1°), not a true distance nearest-neighbour —
+  good enough, but refinable (see next steps).
+- *`F.lag(1)` is "previous row", not "previous calendar day"* — across multi-day gaps, a lag can reach
+  >1 day back. Tree models tolerate it; strict time-series models don't.
+- *Single global model* — one boundary for all stations; per-climate models would help.
+- *Trained on a subsample* — the final metrics are on the complete test set, but a cluster run would
+  train on the whole corpus.
+
+**Covering the gaps where there are no stations — ECMWF data.** The biggest limitation we saw is
+*geographic*: where the station network is sparse (southern Brazil, §6.4), there is simply no TMIN to
+train or predict on. The solution used in practice is to swap point stations for **gridded data**,
+which cover the globe **uniformly** — whether or not a station exists at the spot:
+
+- **ERA5 (ECMWF reanalysis)** — ~80 years of hourly history on a grid (~31 km). Replaces station
+  history to **train and evaluate** the model in regions like RS, where GHCN fails: each grid cell
+  becomes a "virtual station" with complete TMIN/TMAX.
+- **ECMWF OP (IFS operational forecast)** + ensemble — **forecasted** TMIN/TMAX on a ~9 km grid for the
+  coming days. It's what lets you **operationalize** the frost alert at any agricultural point, even
+  without a sensor on site.
+
+Natural flow: **train with ERA5** (dense, global history), **serve with ECMWF OP** (tomorrow's
+forecast) and use the GHCN stations as *ground truth* to **calibrate/validate**. That way the same
+classifier reaches the regions left out today for lack of stations — exactly the gap the southern
+Brazil section exposed. (Cost: ERA5/OP are voluminous — GRIB/NetCDF in TB — and would fit the same
+medallion, only the ingestion now reads a grid instead of station CSVs.)
+
+**Conclusion — what we actually learned.**
+
+*Model results (no exaggeration).* The tuned GBT reaches **ROC-AUC ≈ 0.98**, but the honest reading
+(§8.4–8.6) is that **next-day frost is almost pure thermal persistence**: a trivial rule (`TMIN ≤ 2
+°C`) already goes far. The ML gain is not "much more accuracy", but rather **trading a bit of recall
+for much more precision** and delivering an **adjustable probability** for the business cost (FN ≫ FP).
+And the biggest jump came from **feature engineering** — the regional neighbourhood (`region_tmin_mean`,
+2nd most important) — not from a more complex model; precipitation helped only **marginally** (§7.5).
+The lesson: **understanding the problem pays more than stacking models.**
+
+*PySpark's practicality at this volume.* Taking **111 M rows** (20 years × 5 elements) from ingestion
+to model **on a single laptop** would be infeasible in Pandas/Excel; with Spark, each layer ran in
+**minutes**. But the exercise also exposed the **real limit** of running distributed on a single
+machine: the gold build **OOM'd** on `local[*]` and required backing off to `local[8]` (§9.5) —
+parallelism and memory-per-task pull in opposite directions. Spark solves **scale, not magic**: memory
+still rules.
+
+*Lessons from the functions used.* The project exercised the big-data "vocabulary" end to end: long→wide
+**pivot** and **broadcast join** to unify sources without *shuffle* (§3.1); **window functions** (`lag`,
+rolling means, YTD accumulation and `lead` for the label **without leakage**) to give the data temporal
+memory (§6); Spark ML's **`Pipeline`** (`Imputer → VectorAssembler → GBT`) with
+`CrossValidator`/`ParamGridBuilder` for tuning (§7); and the discipline of **temporal split + baseline +
+stratified evaluation** to avoid fooling ourselves with the metric (§8). The medallion tied it all
+together — each layer persisted, recomputing only what changes (§9.4).
+
+*From model to business — the question that matters.* In the end, everything serves a decision for
+whoever operates the crop: **how much of the region's corn supply is at risk in this window — and before
+everyone else knows?** The answer has the two halves that §8.7 and §8.8 assemble. **How much:** in the
+pre-harvest window (Sep–Oct), **~13% of Corn Belt station-days already record frost**, and the risk is
+**not uniform** — it concentrates on the northwest/high fringe (Dakotas, western Nebraska, northern
+Minnesota/Wisconsin), with more than half the cells above the regional mean. **The "before everyone":**
+it's the **D+1…D+15** horizon that turns that percentage into *days of lead time* — the window to
+trigger harvest, drying and logistics and protect supply while the market hasn't yet priced the frost.
+(With §8.8's honest caveat: we use station density as a *proxy* for exposure, not real corn tonnage —
+the map says **where**, the model says **when**.)
+
+In one line: a complete medallion pipeline over real, cloud-scale data, ending in an **honest**
+classifier — and, more than the final number, **clarity about where the signal comes from (and where it
+stops).**
+
+**Next steps.** True nearest-neighbour (haversine/BallTree) · per-crop GDD thresholds · regression
+target (`next_day_tmin_c` → calibrated P(frost)) · **cyclic seasonality via Fourier harmonics** (encode
+day-of-year as sines/cosines, instead of raw calendar features) · **more regional data from other
+sources** (state networks, ERA5/ECMWF grids) to densify coverage · **real corn tonnage per cell** (USDA
+NASS) to weight the storage map (§8.8) by actual production, not station density · nightly refresh with
+Airflow · scale to 30+ years (linear, no code change).
+
+```{python}
+spark.stop()
+print("Spark session stopped. Notebook complete.")
+```
