@@ -16,13 +16,13 @@ resultado → decisão de negócio) e **mergulhar** em poucas figuras-chave como
 |---|---|---|---|---|
 | 1 | Problema & negócio (abertura/gancho) | **1:00** | §1.1, §1.2 | Avaliação geral · Negócio |
 | 2 | O dataset e **a decisão central: o recorte** | **1:00** | §2.1, §2.4, §9.3 | Limpeza (small data) · Robustez · Criatividade |
-| 3 | Arquitetura **medallion + Spark end-to-end** | **1:15** | §3.1, §6.5 | Implementação · ML end-to-end no Spark |
+| 3 | Arquitetura **medallion + Spark end-to-end** | **1:15** | §3.1, §6.1 | Implementação · ML end-to-end no Spark |
 | 4 | Limpeza & EDA (o sinal nos dados) | **1:15** | §4.1, §5.2, §5.4 | Exploração · Limpeza · Comunicação |
-| 5 | Feature engineering (gold) — **janelas** | **1:00** | §6.1, §6.2, §6.4 | Criatividade · Modelagem · Robustez |
+| 5 | Feature engineering (gold) — **janelas** | **1:00** | §6.1 | Criatividade · Modelagem · Robustez |
 | 6 | Modelagem: baseline → comparação → tuning | **1:30** | §7.1, §7.2, §7.4 | **Modelagem** · Implementação |
 | 7 | Resultados & **avaliação honesta** | **1:30** | §8.1–8.5 | Robustez · Modelagem · Decisão por dados |
-| 8 | Do modelo ao **negócio** | **0:45** | §8.7, §8.8 | Avaliação geral · Negócio |
-| 9 | Limitações, **Spark na prática (OOM)** & conclusão | **0:45** | §9.5, §10 | Robustez · Boas práticas Spark |
+| 8 | Do modelo ao **negócio** + **Conclusão** | **0:45** | §8.7, §8.8, Conclusão | Avaliação geral · Negócio |
+| 9 | Limitações & **Spark na prática (OOM)** | **0:45** | §9.5, §10 | Robustez · Boas práticas Spark |
 | — | **Total** | **~10:00** | | **todos** |
 
 > Sobra ~0 de folga: ensaie uma vez com cronômetro. Se você for de fala rápida, o bloco 7
@@ -36,7 +36,7 @@ Não dá tempo de abrir tudo. Pré-marque estas no HTML (ou exporte para os slid
 contam a história inteira:
 
 1. **§5.2 — Taxa de geada por mês** → "existe um sinal sazonal claro que o modelo precisa aprender".
-2. **§6.5 — As três camadas lado a lado (bronze→silver→gold)** → prova visual do medallion + Spark.
+2. **§5.3 — Do global ao recorte, lado a lado** → a decisão central (recorte) e o alcance do pipeline.
 3. **§7.2 — Comparação de modelos (LR × RF × GBT × baseline)** → decisão por dados entre técnicas.
 4. **§8.3 — Importância das features** → "o modelo raciocina como um agrônomo".
 5. **§8.4 — AUC 0,98 honesto vs. baseline de persistência** → maturidade analítica (o anti-hype).
@@ -69,9 +69,12 @@ contam a história inteira:
   sinal **denso** — gerar "small data" de propósito.
 - Frase de robustez: *"recortamos no espaço para poder ir fundo no tempo num notebook comum; o
   mesmo código escala sem alteração — só muda o `region:` do config."*
+- **Volume real & por que Spark (§2.1):** só o recorte são **~2 GB** em Parquet (bronze **111 M
+  linhas / 366 MB**); no pandas isso infla para **>10 GB** (acima dos ~15 GB de RAM da máquina) — e
+  o GHCN global são **centenas de GB**. Por isso **PySpark, não pandas**.
 - Mostre **§2.4** (mapa global das estações + retângulo do recorte).
 
-### Bloco 3 — Medallion + Spark end-to-end · 1:15 · §3.1, §6.5
+### Bloco 3 — Medallion + Spark end-to-end · 1:15 · §3.1, §6.1
 Este é o slide que prova **"ML end-to-end no Spark"** e **"boas práticas"**.
 - Arquitetura **medallion**: **bronze** (CSV cru → Parquet particionado) → **silver** (long→wide,
   unidades SI, limpo) → **gold** (features de ML) → **modelo**.
@@ -81,7 +84,8 @@ Este é o slide que prova **"ML end-to-end no Spark"** e **"boas práticas"**.
   - **Parquet particionado por ano** + `repartition`/`coalesce`.
 - `pandas` aparece **só** em resultados pequenos e agregados, para plotar — **nunca** para carregar
   o corpus. (Diga isso em voz alta — é um redutor de nota evitado.)
-- Mostre **§6.5** (a mesma estação nas três camadas) — é a foto do pipeline inteiro.
+- Mostre **§6.1** (procedência das features: 8 vêm do NOAA × 22 criadas por nós) — é a foto do que
+  o Spark constrói no gold a partir do bronze cru.
 
 ### Bloco 4 — Limpeza & EDA · 1:15 · §4.1, §5.2, §5.4
 - **Limpeza defensiva** além do Q_FLAG da NOAA: faixa física de temperatura, consistência
@@ -92,15 +96,16 @@ Este é o slide que prova **"ML end-to-end no Spark"** e **"boas práticas"**.
 - ✂️ *(opcional)* **§5.4 — elevação vs. frequência de geada:** sanity check físico (mais alto →
   mais frio → mais geada).
 
-### Bloco 5 — Feature engineering (gold) · 1:00 · §6.1, §6.2, §6.4
+### Bloco 5 — Feature engineering (gold) · 1:00 · §6.1
 - **Funções de janela** (o coração técnico): `lag` (ontem/última semana), médias **móveis** 7/30
   dias, **acúmulo YTD** de GDD, e — crucial — **`lead` para criar o rótulo de amanhã sem
   vazamento**.
 - **Criatividade que rendeu nota:** a **feature regional/vizinhança** (`region_tmin_mean`) via
-  *grid* de 1° — virou a 2ª mais importante. **§6.2:** mostramos por dados que **precipitação ajuda
-  só marginalmente** (ablação) — a temperatura domina.
-- ✂️ *(opcional)* **§6.4 — inversão hemisférica** da estação de geada (e o gap de dados no sul do
-  Brasil) — ótimo se sobrar fôlego; corte primeiro se atrasar.
+  *grid* de 1° — virou a 2ª mais importante.
+- **§6.1 — procedência:** das 30 features, **8 vêm do NOAA** (3 puras + 5 convertidas) e **22 são
+  criadas por nós** (lags, janelas, GDD, vizinhança) — o argumento concreto de "engenharia de features".
+- A pergunta *"a precipitação ajuda?"* fica para o **§7.5** (ablação): ajuda só **marginalmente**, a
+  temperatura domina.
 
 ### Bloco 6 — Modelagem · 1:30 · §7.1, §7.2, §7.4
 O bloco que mais pesa em **"Modelagem"**. Cubra os 4 itens da rubrica:
@@ -111,8 +116,9 @@ O bloco que mais pesa em **"Modelagem"**. Cubra os 4 itens da rubrica:
    Todo modelo tem que **superar a barra do baseline**.
 4. **Métrica + tuning (§7.4):** `CrossValidator` + `ParamGridBuilder` no GBT vencedor, otimizando
    **areaUnderROC**.
-- Honestidade de método: a CV do Spark usa folds **aleatórios** (vaza um pouco no tempo) → serve só
-  para **selecionar** hiperparâmetro; o número honesto vem do **ano de teste reservado**.
+- Honestidade de método (agora explícita no **§7.4**): a CV do Spark usa folds **aleatórios** (vaza
+  um pouco no tempo) → serve só para **selecionar** hiperparâmetro; o número honesto vem do **ano de
+  teste reservado (2024)**, que nenhum fold vê.
 
 ### Bloco 7 — Resultados & avaliação honesta · 1:30 · §8.1–8.5
 **Este bloco é onde se ganha "Robustez" e "decisões baseadas em dados". Não corte.**
@@ -134,14 +140,16 @@ O bloco que mais pesa em **"Modelagem"**. Cubra os 4 itens da rubrica:
 - Frase de fechamento de negócio:
   > *"A pergunta que importa: **quanto da oferta de milho da região está em risco nesta janela — e
   > antes do mercado precificar?** O mapa diz **onde**, o modelo diz **quando**."*
+- **Emende direto na `Conclusão`** (a seção logo após §8.8): os 4 pontos — resultado honesto (0,98 ≈
+  persistência), Spark é **escala, não mágica** (OOM), as funções de aula usadas, e a pergunta de negócio.
 
-### Bloco 9 — Limitações, Spark na prática & conclusão · 0:45 · §9.5, §10
+### Bloco 9 — Limitações & Spark na prática · 0:45 · §9.5, §10
 - **Spark é escala, não mágica:** o build do gold (funções de janela) **estourou OOM** em
   `local[*]`; recuamos para `local[8]` — o trade-off **paralelismo ↔ memória** real.
 - **Limitações honestas:** feature de vizinhança é grade ~1° (não vizinho-mais-próximo real);
   `lag(1)` é "linha anterior", não "dia de calendário"; modelo global único; treino em subamostra
   (métrica final no teste completo).
-- **Conclusão (decore):**
+- **Frase de fecho (decore) — diga na `Conclusão` após §8.8:**
   > *"O maior salto veio de **entender o problema** — a feature de vizinhança — não de empilhar
   > modelos. **Simples > complexo, mas simples ≠ simplório.**"*
 
@@ -186,8 +194,8 @@ Garanta que **cada** critério foi dito em voz alta. Se algum não couber, menci
 
 ## 6 · Dicas de execução
 
-- **Ensaie com cronômetro** ao menos uma vez. O ponto de corte natural se atrasar: §6.4 (inversão
-  hemisférica) e §5.4 (elevação).
+- **Ensaie com cronômetro** ao menos uma vez. O ponto de corte natural se atrasar: §5.9 (precipitação
+  90 dias) e §5.4 (elevação).
 - **Abra o HTML já rolado** nas 7 figuras-herói (ou tenha-as em slides) — não role procurando ao
   vivo.
 - **Comece pelo negócio, termine pelo negócio** (blocos 1 e 8). O miolo técnico (3–7) é a prova.
@@ -203,5 +211,5 @@ Garanta que **cada** critério foi dito em voz alta. Se algum não couber, menci
 ## 7 · Versão ultra-curta (se cortarem para ~6 min)
 
 Mantenha **5 blocos**: Problema/negócio (1) → Recorte + medallion/Spark (2+3 fundidos) →
-Modelagem com baseline e split temporal (6) → Avaliação honesta do 0,98 (7) → Mapa de negócio (8).
-Figuras: **§6.5, §7.2, §8.4, §8.8**. Corte EDA detalhada, ablação e inversão hemisférica.
+Modelagem com baseline e split temporal (6) → Avaliação honesta do 0,98 (7) → Mapa de negócio +
+`Conclusão` (8). Figuras: **§5.3, §7.2, §8.4, §8.8**. Corte EDA detalhada e ablação (§7.5).

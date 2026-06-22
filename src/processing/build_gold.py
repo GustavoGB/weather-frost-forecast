@@ -123,22 +123,6 @@ def add_regional_features(df: DataFrame, grid_deg: int = 1) -> DataFrame:
     return df.drop("grid_lat", "grid_lon")
 
 
-def add_enso_features(df: DataFrame, spark: SparkSession, oni_path) -> DataFrame:
-    """Join the monthly ENSO (El Niño / La Niña) state onto each station-day.
-
-    ONI is one value per calendar month (a Pacific-basin climate state), so this is a
-    tiny **broadcast join** on (year, month) — O(rows), no shuffle of the big side.
-    `oni_anom` is the numeric model feature; `enso_phase` (El Nino/La Nina/Neutral) is
-    kept for stratified EDA. No leakage: the month's ENSO state is known in real time.
-    """
-    oni = (
-        spark.read.option("header", True).option("inferSchema", True).csv(str(oni_path))
-        .select("year", "month",
-                F.col("oni_anom").cast("double"),
-                F.col("enso_phase").cast("string"))
-    )
-    return df.join(F.broadcast(oni), on=["year", "month"], how="left")
-
 
 def add_forward_labels(df: DataFrame) -> DataFrame:
     """Tomorrow's outcomes — the ML targets. Use Window.lead, NEVER raw joins,

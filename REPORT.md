@@ -323,6 +323,22 @@ Pipeline(stages=[
 | **`--sample-fraction`** | Train on a fraction of the train rows to keep laptop runs fast (the reported tuned GBT used `0.1` → 1 319 457 rows). Set to 1.0 on a cluster. |
 | **`PipelineModel.save`** | Persists Imputer fits AND the trained classifier as one artifact, so serving code only loads one path. |
 
+### 5.7 Missing-value strategy
+
+Three kinds of "missing" are handled differently — and a **feature** is imputed
+only at the very last step, while a **label** never is:
+
+| Kind of missing | Treatment | Where |
+|---|---|---|
+| **Untrustworthy** — QC-flagged, impossible value, `TMIN > TMAX` | drop the row (`Q_FLAG`), or set just the bad cell to **NULL** | bronze `ingest_observations`; silver `clean_observations` |
+| **Legitimately absent** — sensor gap, first-N-day lags | **kept as NULL**; derived & regional columns are null-safe (never invented) | silver pivot + `add_derived`; gold windows |
+| **Unusable row** — station `< 30` days, or no next-day label | **filtered out** | gold `--min-station-days`; ML `next_day_is_frost.isNotNull()` |
+| **Remaining feature NULLs** | **median `Imputer`**, fit on the *train split only* (leakage-free), inside the Spark ML `Pipeline`; `VectorAssembler(handleInvalid="keep")` | `train_frost_classifier` |
+
+Median (not mean) is used because the weather variables are heavy-tailed, and
+labels are filtered rather than imputed — imputing a label would fabricate
+ground truth.
+
 ---
 
 ## 6 · Reproducing the pipeline

@@ -13,7 +13,7 @@ format:
     toc: true
     toc-depth: 3
     toc-location: left
-    number-sections: true
+    number-sections: false
     code-fold: true
     code-tools: true
     code-line-numbers: true
@@ -69,7 +69,7 @@ resultados pequenos e já agregados, para plotar (nunca para carregar o corpus).
 - **Limites de máquina são reais.** O build do gold (funções de janela) **estourou OOM** em
   `local[*]`; recuamos para `local[8]` — o trade-off paralelismo↔memória (§9.5).
 - **Hemisfério importa, mas o dado nem sempre existe.** A estação de geada **se inverte** no Sul
-  (jun–ago); a Austrália tem dado denso para mostrar isso, o sul do Brasil **não** (§6.4).
+  (jun–ago); a Austrália tem dado denso para mostrar isso, o sul do Brasil **não**.
 
 > **Nota de escopo.** Este notebook roda um **recorte geográfico reprodutível — o Corn Belt
 > dos EUA — por 20 anos (2005–2024)**: recortamos no espaço (uma região pequena e densa) para
@@ -190,6 +190,8 @@ de ajudar — por quatro motivos:
 > **Em uma frase:** recortar não é "jogar dado fora" — é **alinhar os dados ao problema**,
 > removendo ruído de regiões que o cliente nunca vai usar e investindo o orçamento de dados em
 > profundidade temporal onde ela gera valor.
+
+> **Quanto dado — e por que não pandas?** Só o recorte processado (Corn Belt, 20 anos) já são **~2 GB** em Parquet comprimido em disco (bronze **111 M linhas / 366 MB**, silver 614 MB, gold 1,1 GB). O pandas carregaria tudo em RAM **de uma vez** e, descomprimido em objetos Python, esse volume infla para **>10 GB** — acima do teto de ~15 GB da máquina, e isso **só no recorte**. O GHCN **global** (~3 bilhões de linhas, **centenas de GB**) seria impensável. O Spark processa **por partições, em streaming**, sem nunca segurar o corpus inteiro na memória — por isso o pipeline é PySpark, não pandas.
 
 ### 2.2 · Como fazemos o recorte — Corn Belt dos EUA, 20 anos
 
@@ -639,8 +641,7 @@ com as fronteiras dos estados de referência.
 
 > **Por que isto importa para geada (não é só uma viz solta).** Solo e ar **secos** esfriam mais
 > rápido à noite (menos vapor d'água segurando calor) — então **seca recente eleva o risco de
-> geada radiativa**. Este painel é a leitura *espacial/recente* da mesma `prcp_mm` que a §6.2 testa
-> contra geada e que entra no modelo como `prcp_mm_roll7_sum`. Serve também de **controle de
+> geada radiativa**. Este painel é a leitura *espacial/recente* da mesma `prcp_mm` cuja contribuição para prever geada testamos na ablação da §7.5 e que entra no modelo como `prcp_mm_roll7_sum`. Serve também de **controle de
 > qualidade**: confere se a cobertura de chuva está completa e plausível no recorte.
 
 ```{python}
@@ -761,163 +762,6 @@ print(f"linhas usáveis para ML (têm rótulo): {usable.count():,}")
 print(f"taxa-base de geada (positivos)     : {pos:.1%}")
 ```
 
-### 6.2 · A precipitação ajuda a prever geada?
-
-A `prcp_mm` é a variável de **chuva/neve mais completa** do dataset (~7 % nula, contra ~26–28 %
-da neve). E há uma **hipótese física** clara: noite **seca e limpa** perde calor por radiação →
-**mais geada**; chuva e nuvens recentes seguram o calor → **menos geada**. Abaixo, a taxa de
-geada de amanhã pela **chuva acumulada nos últimos 7 dias**.
-
-> ⚠️ **Atenção à pegadinha da estação do ano.** O inverno é, ao mesmo tempo, **mais seco e mais
-> frio**. Então parte da relação acima pode ser só isso: chuva e geada **andam juntas porque
-> ambas dependem da época do ano** — e não porque a chuva *em si* mude o risco de geada. Este
-> gráfico mostra a relação **crua** (sem separar essa influência comum). Quem decide se a chuva
-> tem valor **próprio** é a ablação da §7.5: lá o modelo é treinado **com** e **sem** a
-> precipitação e os dois são comparados — como a temperatura e a estação do ano já estão no
-> modelo, o que sobrar de diferença é o efeito **só da chuva**.
-
-```{python}
-# 6.2 — Taxa de geada amanhã vs precipitação acumulada nos últimos 7 dias.
-pf = (gold.where(F.col("next_day_is_frost").isNotNull()
-                 & F.col("prcp_mm_roll7_sum").isNotNull())
-      .withColumn("prcp7",
-          F.when(F.col("prcp_mm_roll7_sum") <= 0.1, "0 (seco)")
-           .when(F.col("prcp_mm_roll7_sum") <= 5,  "0–5 mm")
-           .when(F.col("prcp_mm_roll7_sum") <= 15, "5–15 mm")
-           .when(F.col("prcp_mm_roll7_sum") <= 40, "15–40 mm")
-           .otherwise("40+ mm"))
-      .groupBy("prcp7")
-      .agg(F.avg(F.col("next_day_is_frost").cast("double")).alias("frost_rate"),
-           F.count("*").alias("n"))
-      .toPandas())
-order = ["0 (seco)", "0–5 mm", "5–15 mm", "15–40 mm", "40+ mm"]
-pf = pf.set_index("prcp7").reindex(order).reset_index()
-
-fig, ax = plt.subplots(figsize=(9, 4.5))
-bars = ax.bar(pf["prcp7"], pf["frost_rate"] * 100, color="#4C72B0")
-ax.set_title("Taxa de geada amanhã vs chuva acumulada nos últimos 7 dias (Corn Belt)")
-ax.set_xlabel("precipitação dos últimos 7 dias"); ax.set_ylabel("% que gela no dia seguinte")
-for b, n in zip(bars, pf["n"]):
-    ax.text(b.get_x() + b.get_width() / 2, b.get_height(), f"n={n/1e6:.1f}M",
-            ha="center", va="bottom", fontsize=8)
-plt.tight_layout(); plt.show()
-```
-
-### 6.4 · A estação de geada se **inverte** entre os hemisférios (Norte × Sul)
-
-Aqui está a prova visual de **por que a latitude/hemisfério importa**.
-No **Hemisfério Norte** (Corn Belt) a geada acontece no inverno **boreal**, de **dez–fev**. No
-**Hemisfério Sul**, o inverno é em **jun–ago** — então a estação de geada fica **espelhada**.
-
-**Dois recortes no Hemisfério Sul — para diversificar e mostrar onde a análise esbarra nos dados.**
-Assim como recortamos os EUA por uma caixa (§2.2), recortamos duas regiões do Sul:
-
-- **Sul do Brasil (RS + serra catarinense)** — `BR`, `lat −34..−27°`, `lon −58..−49°`, incluindo
-  **São Joaquim (~1402 m, o ponto mais frio do Brasil)**. Mas o GHCN é **esparso** aqui: das 255
-  estações da caixa, **só 8 medem TMIN**, a maioria de baixa altitude (geada rara) — ~**7,5 mil**
-  observações no total.
-- **Sudeste da Austrália + Tasmânia** — planaltos de NSW/VIC, *Snowy Mountains* e terras altas da
-  Tasmânia, onde a geada é **risco agrícola real** (trigo/canola). Aqui o GHCN é **denso e longo**:
-  8 estações frost-prone somam ~**116 mil** observações de TMIN.
-
-O contraste **é** o ponto: a mesma análise é **possível nos dois**, mas com qualidades de dado
-opostas — o RS mostra o **limite** (sinal magro), a Austrália mostra o **caso rico**. Em ambos
-baixamos as estações direto pelos arquivos *por-estação* do GHCN (sem reingerir nada). Os **mapas
-abaixo** mostram os pontos capturados (cor = elevação); em seguida, a climatologia mensal revela a
-**inversão** — normalizamos **cada curva pelo seu próprio pico** para comparar o **formato** sazonal.
-
-> **Nota honesta.** Nenhum recorte do Sul tem densidade para *modelar* (sem vizinhança); servem como
-> **climatologia** que prova a inversão. O RS é tão esparso que sua curva fica "magra" (pico de só
-> ~3 % de dias com geada, contra ~56 % na Austrália). Por isso o estudo principal segue só no Corn
-> Belt.
-
-```{python}
-# 6.4a — Estações de TMIN capturadas: sul do Brasil (esparso) × sudeste da Austrália (denso).
-import matplotlib.patches as mpatches  # noqa: E402
-rs = pd.read_csv(resolve("data/ref/southern_stations.csv"))
-au = pd.read_csv(resolve("data/ref/australia_stations.csv"))
-
-def _stmap(ax, sta, box, title):   # box = (lat_min, lat_max, lon_min, lon_max)
-    s = ax.scatter(sta["longitude"], sta["latitude"], c=sta["elevation_m"],
-                   cmap="terrain", s=110, edgecolor="black", linewidth=0.6, zorder=3)
-    ax.add_patch(mpatches.Rectangle((box[2], box[0]), box[3] - box[2], box[1] - box[0],
-                 fill=False, edgecolor="red", lw=1.5, ls="--", zorder=2))
-    for _, r in sta.iterrows():
-        ax.annotate(r["name"], (r["longitude"], r["latitude"]),
-                    textcoords="offset points", xytext=(5, 3), fontsize=7, zorder=4)
-    ax.set_xlim(box[2] - 1, box[3] + 1); ax.set_ylim(box[0] - 1, box[1] + 1)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_title(title); ax.set_xlabel("longitude"); ax.set_ylabel("latitude")
-    return s
-
-fig, (a1, a2) = plt.subplots(1, 2, figsize=(15, 6))
-_stmap(a1, rs, (-34.0, -27.0, -58.0, -49.0), f"Sul do Brasil — {len(rs)} estações (esparso)")
-sc = _stmap(a2, au, (-43.5, -28.0, 144.0, 153.0), f"Sudeste da Austrália — {len(au)} estações (denso)")
-fig.colorbar(sc, ax=a2, label="elevação (m)")
-plt.tight_layout(); plt.show()
-```
-
-```{python}
-# 6.4 — Inversão da estação de geada: Corn Belt (N) vs Austrália e sul do Brasil (S).
-# Norte: taxa de geada por mês a partir do gold (Spark). Sul: CSVs pré-computados (by_station).
-north = (gold.where(F.col("is_frost_day").isNotNull())
-         .groupBy("month").agg(F.avg(F.col("is_frost_day").cast("double")).alias("frost_rate"))
-         .orderBy("month").toPandas())
-south = pd.read_csv(resolve("data/ref/southern_frost.csv"))     # RS (esparso)
-aus = pd.read_csv(resolve("data/ref/australia_frost.csv"))      # Austrália (denso)
-
-# normaliza cada série pelo próprio pico -> compara o FORMATO sazonal (a inversão)
-for d in (north, south, aus):
-    d["rel"] = 100 * d["frost_rate"] / d["frost_rate"].max()
-meses = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
-
-fig, ax = plt.subplots(figsize=(11, 4.5))
-ax.plot(north["month"], north["rel"], "-o", color="#4C72B0",
-        label="Corn Belt — EUA (Norte)")
-ax.plot(aus["month"], aus["rel"], "-o", color="#55A868",
-        label="Sudeste da Austrália (Sul, denso)")
-ax.plot(south["month"], south["rel"], "--o", color="#C44E52", alpha=0.7,
-        label="Sul do Brasil — RS (Sul, esparso)")
-ax.axvspan(5.5, 8.5, color="#C44E52", alpha=0.06)   # inverno austral
-ax.axvspan(0.5, 2.5, color="#4C72B0", alpha=0.06)   # inverno boreal (jan-fev)
-ax.set_xticks(range(1, 13), labels=meses)
-ax.set_title("A estação de geada se INVERTE entre os hemisférios (pico de cada lado em meses opostos)")
-ax.set_xlabel("mês"); ax.set_ylabel("intensidade de geada\n(% do pico de cada região)")
-ax.legend(loc="upper center")
-plt.tight_layout(); plt.show()
-```
-
-### 6.5 · As três camadas lado a lado (bronze → silver → gold)
-
-Para fechar a parte de engenharia, aqui está a **mesma estação** vista em cada camada do medallion
-— concretizando a transformação que descrevemos:
-
-- **Bronze (cru, formato *longo*):** uma linha por (estação, dia, **ELEMENT**) — TMAX, TMIN, PRCP…
-  empilhados, em décimos de unidade, sem metadados.
-- **Silver (limpo, *largo*, SI):** uma linha por **estação-dia**; cada ELEMENT vira coluna
-  (`tmin_c`, `tmax_c`, `prcp_mm`), já em °C/mm e com os metadados da estação juntados.
-- **Gold (pronto para ML):** o silver **+ as features** (lags, médias móveis, GDD, vizinhança)
-  e o **rótulo** `next_day_is_frost`.
-
-```{python}
-# 6.5 — A mesma estação nas três camadas: bronze (longo) → silver (largo/SI) → gold (features).
-ex_id = gold.groupBy("id").count().orderBy(F.desc("count")).first()["id"]   # estação com mais dados
-print(f"Estação de exemplo: {ex_id}\n")
-
-print("BRONZE — cru, formato LONGO (1 linha por ELEMENT/dia, valor em décimos):")
-(bronze_obs.where(F.col("id") == ex_id)
- .select("id", "date", "element", "value").orderBy("date", "element").show(8))
-
-print("SILVER — limpo, LARGO, SI + metadados da estação (1 linha/dia):")
-(silver.where(F.col("id") == ex_id)
- .select("id", "date", "name", "tmin_c", "tmax_c", "prcp_mm").orderBy("date").show(5))
-
-print("GOLD — silver + FEATURES de ML + rótulo (1 linha/dia, 48 colunas no total):")
-(gold.where(F.col("id") == ex_id)
- .select("id", "date", "tmin_c", "tmin_c_lag_1", "tmin_c_roll7_mean",
-         "region_tmin_mean", "gdd_corn_ytd", "next_day_is_frost").orderBy("date").show(5))
-```
-
 ## 7 · Modelagem
 
 **Rótulo.** `next_day_is_frost` (binário). **Split.** *Temporal*: treina em
@@ -1011,6 +855,10 @@ for i, v in enumerate(comparison["f1"]):
 plt.xticks(rotation=15); plt.tight_layout(); plt.show()
 ```
 
+### 7.4 · Tuning (CrossValidator) — e a honestidade do método
+
+Otimizamos `maxDepth`/`maxIter` do GBT vencedor por **k-fold CV** (`areaUnderROC`). **Ressalva honesta:** o `CrossValidator` do Spark usa folds **aleatórios** → vaza levemente no tempo (um fold pode treinar em dias *posteriores* aos que valida). Por isso ele serve **só para *selecionar* hiperparâmetros**; o número honesto vem do **ano de teste reservado (2024)**, que nenhum fold enxerga. O remédio rigoroso — folds encadeados no tempo (*forward-chaining*) — o Spark ML não traz nativo. Em uma linha: o vazamento afeta **qual** modelo escolhemos, nunca **o quão bom** dizemos que ele é.
+
 ```{python}
 # 7.4 — Tuning de hiperparâmetros do GBT vencedor via CrossValidator.
 # Grid pequeno + amostra pequena para terminar no notebook; o que importa é o *método*.
@@ -1044,7 +892,7 @@ for params, auc in sorted(zip(grid, cv_model.avgMetrics), key=lambda x: -x[1]):
 
 ### 7.5 · Ablação: a precipitação ajuda o modelo?
 
-O gráfico da §6.2 mostra que a precipitação **anda junto** com a geada — mas,
+A precipitação **anda junto** com a geada — solo e ar secos esfriam mais rápido à noite (§5.9) — mas,
 como vimos na "pegadinha da estação do ano", andar junto **não prova** que ajuda a *prever*.
 Para testar isso de verdade, fazemos uma **ablação**: treinamos o **mesmo modelo GBT duas
 vezes** —
@@ -1181,7 +1029,7 @@ def auc_from_score(pdf, score_col, label_col):
     order = np.argsort(-s); y = y[order]
     P, N = y.sum(), (1 - y).sum()
     tpr = np.cumsum(y) / P; fpr = np.cumsum(1 - y) / N
-    return float(np.trapz(tpr, fpr))
+    return float((np.trapezoid if hasattr(np, "trapezoid") else np.trapz)(tpr, fpr))
 
 pers = (test.select((-F.col("tmin_c")).alias("score"), F.col(LABEL_COL).alias("y"))
         .where(F.col("score").isNotNull()).sample(False, 0.05, seed=11).toPandas())
@@ -1339,10 +1187,12 @@ quase só "vai continuar parecido com hoje" (persistência térmica), enquanto p
 dias** depende de mudanças de larga escala da atmosfera — os *padrões sinóticos* —, bem mais
 difíceis de antecipar.
 
+**Como medimos a acurácia de cada horizonte (sem vazamento).** Cada GBT D+k é treinado nos anos `< 2024` e avaliado **só no ano reservado de 2024** — o mesmo split temporal honesto do modelo D+1 —, então acurácia/ROC-AUC/F1 são sempre sobre dias que o modelo **nunca viu**. (Estudo ilustrativo: roda sobre uma amostra de ~4% das estações, mantendo a série temporal **inteira** de cada uma para o `lead` continuar válido.)
+
 ```{python}
 # Rótulos multi-horizonte: geada em D+k por estação, ordenado por data (lead, sem vazamento).
 # Estudo ILUSTRATIVO de decaimento de skill: em vez de cachear o gold INTEIRO (~40 M linhas, que
-# transbordam ~12 GB para disco e pressionam o heap), amostramos ~10% das ESTAÇÕES — cada série
+# transbordam ~12 GB para disco e pressionam o heap), amostramos ~4% das ESTAÇÕES — cada série
 # temporal fica INTEIRA, então o `lead` continua válido. O frame resultante CABE em RAM: ~mesmo
 # volume de treino, sem o spill de ~12 GB do gold inteiro (bem mais leve para a máquina).
 from pyspark.sql import Window  # noqa: E402
@@ -1358,7 +1208,7 @@ gold = spark.read.parquet(str(GOLD))
 
 w_h = Window.partitionBy("id").orderBy("date")
 HORIZONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-st_keep = gold.select("id").distinct().sample(False, 0.10, seed=42)   # ~10% das estações
+st_keep = gold.select("id").distinct().sample(False, 0.04, seed=42)   # ~4% das estações (amostra ilustrativa; cabe no heap)
 multi = gold.join(F.broadcast(st_keep), on="id", how="inner")
 for k in HORIZONS:
     multi = multi.withColumn(f"y_h{k}", F.lead("is_frost_day", k).over(w_h).cast("double"))
@@ -1457,6 +1307,18 @@ plt.tight_layout(); plt.show()
 
 > **Leitura.** O risco de geada pré-colheita cai de **norte→sul** (mesma estrutura da §5.8): a franja **noroeste/alta** — Dakotas, oeste de Nebraska, norte de Minnesota/Wisconsin — é onde a geada de outono é mais frequente, e onde armazém + secador locais mais reduzem perda de safra. Os ★ combinam esse risco com cobertura (exposição): são as células onde **investir primeiro**.
 
+## Conclusão
+
+**Resultados do modelo (sem exagero).** O GBT tunado chega a **ROC-AUC ≈ 0,98**, mas a leitura honesta (§8.4–8.6) é que **a geada do dia seguinte é quase pura persistência térmica**: uma regra trivial (`TMIN ≤ 2 °C`) já vai longe. O ganho do ML não é "muito mais acerto", e sim **trocar um pouco de recall por bem mais precisão** e entregar uma **probabilidade ajustável** ao custo de negócio (FN ≫ FP). O modelo **raciocina como um agrônomo** — a `TMIN` de hoje, a **TMIN média da vizinhança** (`region_tmin_mean`, 2ª feature mais importante) e a noite mais fria da semana (`tmin_c_roll7_min`) dominam o sinal. E o maior salto veio de **engenharia de feature** — essa vizinhança regional — não de um modelo mais complexo; a precipitação ajudou só **marginalmente** (§7.5). A lição: **entender o problema rende mais que empilhar modelos.**
+
+**Praticidade do PySpark neste volume.** Levar **111 M de linhas** (20 anos × 5 elementos) da ingestão ao modelo **num único laptop** seria inviável em Pandas/Excel; com Spark, cada camada rodou em **minutos**. Mas o exercício também expôs o **limite real** de rodar distribuído numa só máquina: o build do gold **estourou OOM** em `local[*]` e exigiu recuar para `local[8]` (§9.5) — paralelismo e memória por task puxam em direções opostas. Spark resolve **escala, não mágica**: a memória ainda manda.
+
+**Aprendizados com as funções usadas.** O projeto exercitou o "vocabulário" de big data ponta a ponta: **pivô** long→wide e **broadcast join** para unificar fontes sem *shuffle* (§3.1); **funções de janela** (`lag`, médias móveis, acúmulo YTD e `lead` para o rótulo **sem vazamento**) para dar memória temporal ao dado (§6); o **`Pipeline` do Spark ML** (`Imputer → VectorAssembler → GBT`) com `CrossValidator`/`ParamGridBuilder` no tuning (§7); e a disciplina de **split temporal + baseline + avaliação estratificada** para não se iludir com a métrica (§8). O medallion amarrou tudo — cada camada persistida, recalculando só o que muda (§9.4).
+
+**Do modelo ao negócio — a pergunta que importa.** No fim, tudo serve a uma decisão de quem opera a safra: **quanto da oferta de milho da região está em risco nesta janela — e antes de todo mundo saber?** A resposta tem as duas metades que §8.7 e §8.8 montam. **O quanto:** na janela pré-colheita (set–out), **~13 % dos estação-dias do Corn Belt já registram geada**, e o risco **não é uniforme** — concentra-se na franja noroeste/alta (Dakotas, oeste de Nebraska, norte de Minnesota/Wisconsin). **O "antes de todo mundo":** é o horizonte **D+1…D+15** que transforma esse percentual em *dias de antecedência* — a janela para acionar colheita, secagem e logística e proteger a oferta enquanto o mercado ainda não precificou a geada. (Com a ressalva honesta da §8.8: usamos densidade de estações como *proxy* de exposição, não a tonelagem real de milho — o mapa diz **onde**, o modelo diz **quando**.)
+
+Em uma linha: um pipeline medallion completo sobre dados reais em escala de nuvem, terminando num classificador **honesto** — e, mais do que o número final, **clareza sobre de onde vem (e onde para) o sinal**.
+
 ## 9 · Ambiente de execução, volumes de dados & desempenho
 
 Para reprodutibilidade, registramos **onde** este relatório rodou, **quanto dado** o pipeline
@@ -1532,7 +1394,7 @@ A tabela deixa explícito **quantas linhas o pipeline processa** em cada escopo 
 |---|---|---|---|---|
 | **Global — GHCN inteiro** | ~120 mil | ~3 **bilhões** de obs diárias (1763–hoje) | densa só em parte do globo | inviável processar inteiro num laptop; usamos só a **fatia de 2024** (37 M linhas, 13,5 k estações) para o mapa-múndi |
 | **Recorte EUA — Corn Belt (2005–2024)** | ~19,7 mil | **111 M** (bronze) → **40,3 M** estação-dia (silver/gold) | densa | **dataset que treina o modelo** |
-| **Recorte RS — sul do Brasil** | 255 no box (**só 8 com TMIN**) | **7,5 mil** obs de TMIN | esparsíssima | só a **climatologia** da inversão (§6.4); não dá para modelar |
+| **Recorte RS — sul do Brasil** | 255 no box (**só 8 com TMIN**) | **7,5 mil** obs de TMIN | esparsíssima | só a **climatologia** da geada do sul (inversão hemisférica); não dá para modelar |
 
 > O salto **3 bilhões → 40 milhões → 7 mil** linhas é o projeto numa frase: recortar não é jogar
 > dado fora — é **gastar o orçamento computacional onde há sinal** (Corn Belt, denso) e reconhecer
@@ -1597,13 +1459,7 @@ Graças ao medallion (§9.4), estender é **barato e localizado** — só recalc
 > Em todos os casos, o caro (bronze, 111 M linhas) é **reaproveitado**; recalculamos apenas o que
 > realmente mudou.
 
-## 10 · Limitações, conclusões & próximos passos
-
-**O que o resultado diz.** O GBT tunado supera o baseline por regra e raciocina exatamente como
-um especialista do domínio: a `TMIN` de hoje, a **TMIN média da vizinhança** (`region_tmin_mean`,
-que virou a 2ª feature mais importante) e a noite mais fria da última semana
-(`tmin_c_roll7_min`) dominam o sinal. Adicionar a feature regional foi a melhoria de maior
-retorno — exatamente o que as importâncias espaciais fracas do baseline anterior indicavam.
+## 10 · Limitações & próximos passos
 
 **Limitações (honestas).**
 
@@ -1617,7 +1473,7 @@ retorno — exatamente o que as importâncias espaciais fracas do baseline anter
   execução em cluster treinaria no corpus inteiro.
 
 **Cobrindo as lacunas onde não há estações — dados do ECMWF.** A maior limitação que vimos é
-*geográfica*: onde a rede de estações é esparsa (o sul do Brasil, §6.4), simplesmente não há TMIN
+*geográfica*: onde a rede de estações é esparsa (o sul do Brasil, §9.3), simplesmente não há TMIN
 para treinar nem prever. A solução usada na prática é trocar estações pontuais por **dados em
 grade**, que cobrem o globo **uniformemente** — exista ou não estação no local:
 
@@ -1633,47 +1489,6 @@ previsão de amanhã) e usar as estações GHCN como *ground truth* para **calib
 mesmo classificador alcança as regiões que hoje ficam de fora por falta de estação — exatamente o
 gap que a seção do sul do Brasil expôs. (Custo: ERA5/OP são volumosos — GRIB/NetCDF em TB — e
 encaixariam no mesmo medallion, só que a ingestão passa a ler grade em vez de CSV de estação.)
-
-**Conclusão — o que de fato aprendemos.**
-
-*Resultados do modelo (sem exagero).* O GBT tunado chega a **ROC-AUC ≈ 0,98**, mas a leitura
-honesta (§8.4–8.6) é que **a geada do dia seguinte é quase pura persistência térmica**: uma regra
-trivial (`TMIN ≤ 2 °C`) já vai longe. O ganho do ML não é "muito mais acerto", e sim **trocar um
-pouco de recall por bem mais precisão** e entregar uma **probabilidade ajustável** ao custo de
-negócio (FN ≫ FP). E o maior salto veio de **engenharia de feature** — a vizinhança regional
-(`region_tmin_mean`, 2ª mais importante) — não de um modelo mais complexo; a precipitação ajudou
-só **marginalmente** (§7.5). A lição: **entender o problema rende mais que empilhar
-modelos.**
-
-*Praticidade do PySpark neste volume.* Levar **111 M de linhas** (20 anos × 5 elementos) da
-ingestão ao modelo **num único laptop** seria inviável em Pandas/Excel; com Spark, cada camada
-rodou em **minutos**. Mas o exercício também expôs o **limite real** de rodar distribuído numa só
-máquina: o build do gold **estourou OOM** em `local[*]` e exigiu recuar para `local[8]` (§9.5) —
-paralelismo e memória por task puxam em direções opostas. Spark resolve **escala, não mágica**: a
-memória ainda manda.
-
-*Aprendizados com as funções usadas.* O projeto exercitou o "vocabulário" de big data ponta a
-ponta: **pivô** long→wide e **broadcast join** para unificar fontes sem *shuffle* (§3.1); **funções
-de janela** (`lag`, médias móveis, acúmulo YTD e `lead` para o rótulo **sem vazamento**) para dar
-memória temporal ao dado (§6); o **`Pipeline` do Spark ML** (`Imputer → VectorAssembler → GBT`)
-com `CrossValidator`/`ParamGridBuilder` no tuning (§7); e a disciplina de
-**split temporal + baseline + avaliação estratificada** para não se iludir com a métrica (§8). O
-medallion amarrou tudo — cada camada persistida, recalculando só o que muda (§9.4).
-
-*Do modelo ao negócio — a pergunta que importa.* No fim, tudo serve a uma decisão de quem opera a
-safra: **quanto da oferta de milho da região está em risco nesta janela — e antes de todo mundo
-saber?** A resposta tem as duas metades que §8.7 e §8.8 montam. **O quanto:** na janela
-pré-colheita (set–out), **~13 % dos estação-dias do Corn Belt já registram geada**, e o risco **não
-é uniforme** — concentra-se na franja noroeste/alta (Dakotas, oeste de Nebraska, norte de
-Minnesota/Wisconsin), com mais da metade das células acima da média regional. **O "antes de todo
-mundo":** é o horizonte **D+1…D+15** que transforma esse percentual em *dias de antecedência* — a
-janela para acionar colheita, secagem e logística e proteger a oferta enquanto o mercado ainda não
-precificou a geada. (Com a ressalva honesta da §8.8: usamos densidade de estações como *proxy* de
-exposição, não a tonelagem real de milho — o mapa diz **onde**, o modelo diz **quando**.)
-
-Em uma linha: um pipeline medallion completo sobre dados reais em escala de nuvem, terminando num
-classificador **honesto** — e, mais do que o número final, **clareza sobre de onde vem (e onde
-para) o sinal**.
 
 **Próximos passos.** Vizinho-mais-próximo real (haversine/BallTree) · limiares de GDD por
 cultura · alvo de regressão (`next_day_tmin_c` → P(geada) calibrada) · **sazonalidade cíclica
