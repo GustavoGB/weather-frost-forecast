@@ -774,12 +774,16 @@ Seguimos o princípio *"simples > complexo"*: primeiro um **baseline trivial por
 árvores** do Spark ML (RandomForest e GBT), então **comparação** e **tuning** de hiperparâmetros
 com `CrossValidator`. Um modelo só merece a complexidade dele se vencer o baseline.
 
+**Função de perda.** O GBT vencedor minimiza **log loss** (perda logística / desvio binomial — em Spark, `GBTClassifier` só suporta `lossType='logistic'`), assim como a Regressão Logística; o RandomForest, por contraste, cresce árvores por **impureza de Gini**. Como log loss é uma *proper scoring rule*, o modelo aprende **probabilidades calibradas**, não apenas uma classe 0/1 — é o que viabiliza o *Frost-Risk Score* e o ajuste de limiar. Vale distinguir três objetivos: **treino** minimiza log loss, a **seleção** de hiperparâmetros usa **ROC-AUC** (§7.4), e a **decisão** final move o limiar pelo custo de negócio (FN ≫ FP, §8.5).
+
 > **Qual é, exatamente, o dataset que treina o modelo?**
 > A tabela **gold** (`data/gold/station_daily_features/`), filtrada para as linhas que têm
 > rótulo (`next_day_is_frost` não-nulo), no recorte **Corn Belt** e período **2005–2024**.
 > Cada linha é uma **estação-dia**. **X** = as **30 features** da §6.1; **y** =
 > `next_day_is_frost` (0/1). **Treino** = anos `< 2024`; **teste** = ano `2024` (split
 > temporal). O treino é subamostrado (10 %) só por velocidade; o teste fica 100 %.
+
+**A subamostra de 10% custa qualidade? Não — verificamos.** Treinar o mesmo GBT em **100% do treino** (13,2 M linhas, ~3,7 min nesta máquina de 16 GB) dá **ROC-AUC 0,9742** contra **0,9743** com 10% (1,3 M linhas) — idêntico dentro do ruído (Δ < 0,001 em todas as métricas). O sinal **satura** bem antes de 1,3 M estação-dias (geada é muito persistente), então a subamostra é só **velocidade**, sem perda de qualidade — e o pipeline treina em 100% sem mudar uma linha.
 
 ```{python}
 # Reutiliza os helpers de treino de produção — mesma lista de features, mesmo pipeline.
@@ -857,7 +861,11 @@ plt.xticks(rotation=15); plt.tight_layout(); plt.show()
 
 ### 7.4 · Tuning (CrossValidator) — e a honestidade do método
 
-Otimizamos `maxDepth`/`maxIter` do GBT vencedor por **k-fold CV** (`areaUnderROC`). **Ressalva honesta:** o `CrossValidator` do Spark usa folds **aleatórios** → vaza levemente no tempo (um fold pode treinar em dias *posteriores* aos que valida). Por isso ele serve **só para *selecionar* hiperparâmetros**; o número honesto vem do **ano de teste reservado (2024)**, que nenhum fold enxerga. O remédio rigoroso — folds encadeados no tempo (*forward-chaining*) — o Spark ML não traz nativo. Em uma linha: o vazamento afeta **qual** modelo escolhemos, nunca **o quão bom** dizemos que ele é.
+Afinamos os hiperparâmetros do GBT vencedor — `maxDepth` (profundidade das árvores) e `maxIter` (nº de árvores) — com **validação cruzada k-fold**: o `CrossValidator` divide o treino em 3 *folds*, testa cada combinação do grid (`maxDepth ∈ {4, 6}` × `maxIter ∈ {20, 40}` = 4 combinações × 3 folds = **12 treinos**) e fica com a de maior **ROC-AUC** médio.
+
+**Ressalva honesta:** o `CrossValidator` do Spark sorteia os *folds* **aleatoriamente**, ignorando a data — então um fold de treino pode conter dias *posteriores* aos do fold de validação (ex.: treina em 10/mar, valida em 05/mar). É um leve **vazamento temporal** que deixa as notas internas da CV otimistas demais. Mas como ele atinge **todas as combinações por igual**, o *ranking* entre elas quase não muda — por isso a CV serve **só para *escolher*** os hiperparâmetros, nunca para medir desempenho.
+
+O número que reportamos (**ROC-AUC ≈ 0,98**) não vem da CV, e sim do **ano de teste reservado (2024)** — treinado só nos anos anteriores e nunca tocado por nenhum fold —, um split **temporal puro**, sem vazamento. O remédio 100% rigoroso seriam *folds* **encadeados no tempo** (*forward-chaining*: treina 2005–2018 → valida 2019; treina 2005–2019 → valida 2020; …), que o Spark ML não traz nativo. Em uma linha: o vazamento afeta **qual** modelo escolhemos, nunca **o quão bom** dizemos que ele é.
 
 ```{python}
 # 7.4 — Tuning de hiperparâmetros do GBT vencedor via CrossValidator.
@@ -1469,8 +1477,9 @@ Graças ao medallion (§9.4), estender é **barato e localizado** — só recalc
   um lag pode alcançar >1 dia atrás. Modelos de árvore toleram; modelos estritos de série
   temporal, não.
 - *Modelo global único* — uma fronteira para todas as estações; modelos por clima ajudariam.
-- *Treinado numa subamostra* — as métricas finais são no conjunto de teste completo, mas uma
-  execução em cluster treinaria no corpus inteiro.
+- *Treinado numa subamostra (10 %), por velocidade* — **verificamos que isso não custa qualidade**:
+  treinar em 100 % (13,2 M linhas) dá ROC-AUC 0,9742 vs 0,9743 com 10 % (Δ < 0,001). As métricas
+  finais são no teste 2024 completo, e o pipeline treina em 100 % sem alteração.
 
 **Cobrindo as lacunas onde não há estações — dados do ECMWF.** A maior limitação que vimos é
 *geográfica*: onde a rede de estações é esparsa (o sul do Brasil, §9.3), simplesmente não há TMIN

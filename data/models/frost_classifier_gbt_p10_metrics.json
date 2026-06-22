@@ -1,0 +1,72 @@
+{
+  "algorithm": "gbt",
+  "test_year": 2024,
+  "sample_fraction": 0.1,
+  "n_train": 1319457,
+  "n_test": 615491,
+  "tuning": null,
+  "metrics": {
+    "roc_auc": 0.9743266180589533,
+    "pr_auc": 0.9526190823855841,
+    "accuracy": 0.9125543671637766,
+    "f1": 0.9127741624798642,
+    "weighted_precision": 0.9131050609475507,
+    "weighted_recall": 0.9125543671637766
+  },
+  "confusion": {
+    "tn": 374165,
+    "fp": 29227,
+    "fn": 24595,
+    "tp": 187504
+  },
+  "top_features": [
+    {
+      "feature": "region_tmin_mean",
+      "importance": 0.5685963765528657
+    },
+    {
+      "feature": "tmin_c",
+      "importance": 0.13110681207201785
+    },
+    {
+      "feature": "region_tmin_min",
+      "importance": 0.08110435173639131
+    },
+    {
+      "feature": "tavg_c",
+      "importance": 0.06459100437223896
+    },
+    {
+      "feature": "tmin_c_roll7_mean",
+      "importance": 0.02137879599306046
+    },
+    {
+      "feature": "day_of_year",
+      "importance": 0.01986059170520427
+    },
+    {
+      "feature": "tmin_c_lag_1",
+      "importance": 0.017838021054524925
+    },
+    {
+      "feature": "tmin_c_roll30_mean",
+      "importance": 0.016922832985801717
+    },
+    {
+      "feature": "tmin_minus_region",
+      "importance": 0.012083198766783761
+    },
+    {
+      "feature": "longitude",
+      "importance": 0.00895348808267884
+    },
+    {
+      "feature": "tmax_c_lag_1",
+      "importance": 0.008441206555940618
+    },
+    {
+      "feature": "tmax_c",
+      "importance": 0.00720874820527329
+    }
+  ]
+}
